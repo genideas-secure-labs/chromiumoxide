@@ -437,6 +437,7 @@ impl Handler {
                 viewport: self.config.viewport.clone(),
                 request_intercept: self.config.request_intercept,
                 cache_enabled: self.config.cache_enabled,
+                stealth_mode: self.config.stealth_mode,
             },
             browser_ctx,
         );
@@ -669,6 +670,11 @@ pub struct HandlerConfig {
     pub request_intercept: bool,
     /// Whether to enable cache
     pub cache_enabled: bool,
+    /// Stealth mode: minimize CDP domain enables to reduce bot detection footprint.
+    /// When true, skips Performance.enable, Log.enable, Network.enable (unless
+    /// request_intercept is on), Page.createIsolatedWorld, and sets
+    /// waitForDebuggerOnStart to false.
+    pub stealth_mode: bool,
 }
 
 impl Default for HandlerConfig {
@@ -681,6 +687,7 @@ impl Default for HandlerConfig {
             request_timeout: Duration::from_millis(REQUEST_TIMEOUT),
             request_intercept: false,
             cache_enabled: true,
+            stealth_mode: false,
         }
     }
 }
