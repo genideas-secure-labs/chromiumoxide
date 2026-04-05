@@ -358,12 +358,11 @@ impl Target {
                             }
                             // Stealth: skip Network.enable unless request_intercept is needed
                             if self.config.stealth_mode && !self.config.request_intercept {
-                                self.init_state = TargetInit::InitializingPage(
-                                    Self::page_init_commands(
+                                self.init_state =
+                                    TargetInit::InitializingPage(Self::page_init_commands(
                                         self.config.request_timeout,
                                         self.config.stealth_mode,
-                                    ),
-                                );
+                                    ));
                             } else {
                                 self.init_state = TargetInit::InitializingNetwork(
                                     self.network_manager.init_commands(),
