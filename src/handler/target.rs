@@ -160,12 +160,28 @@ impl Target {
     }
 
     fn create_page(&mut self) {
-        if self.page.is_none() {
-            if let Some(session) = self.session_id.clone() {
-                let handle =
-                    PageHandle::new(self.target_id().clone(), session, self.opener_id().cloned());
-                self.page = Some(handle);
-            }
+        // No active session → can't bind a PageHandle. Leave any stale cache
+        // in place; the next attach will trigger a rebuild via the mismatch
+        // check below.
+        let Some(session) = self.session_id.clone() else {
+            return;
+        };
+
+        // Rebuild the cached PageHandle when its session no longer matches
+        // the target's current session. This is what makes detach + reattach
+        // (or any session rotation) safe for callers: previously the first
+        // call to `get_or_create_page` cached a PageHandle bound to S1, and
+        // subsequent calls — even after S1 was torn down and S2 attached —
+        // kept returning the S1-bound handle, so every command came back
+        // with `Error -32001: Session with given id not found`.
+        let session_matches = self
+            .page
+            .as_ref()
+            .is_some_and(|p| p.inner().session_id() == &session);
+        if !session_matches {
+            let handle =
+                PageHandle::new(self.target_id().clone(), session, self.opener_id().cloned());
+            self.page = Some(handle);
         }
     }
 
