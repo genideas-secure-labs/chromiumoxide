@@ -461,7 +461,31 @@ impl Handler {
         // remove the session
         if let Some(session) = self.sessions.remove(&event.session_id) {
             if let Some(target) = self.targets.get_mut(session.target_id()) {
-                target.session_id_mut().take();
+                // A single target can have multiple attached sessions
+                // simultaneously. Only the CURRENT session is cached
+                // on `target.session_id` / `target.page`; if the event
+                // is for an older/secondary session, leave the live
+                // session intact. Without this guard, detaching an
+                // older session would wipe the cached handle for the
+                // session that's still live, and the next `get_page`
+                // would spuriously return `CdpError::NotFound`.
+                let is_current = target.session_id() == Some(&event.session_id);
+                if is_current {
+                    target.session_id_mut().take();
+                    // Also drop the cached PageHandle so any caller
+                    // that races a `Target.attachToTarget` reply against
+                    // the matching `attachedToTarget` event window —
+                    // the handler drains `HandlerMessage` commands
+                    // (`GetPage`) before connection events in a single
+                    // poll tick, so it's reachable — receives a clean
+                    // `CdpError::NotFound` instead of a `PageHandle`
+                    // bound to the dead session (every command would
+                    // otherwise come back as `-32001: Session with
+                    // given id not found`). Callers treat `NotFound`
+                    // as a retryable signal until the next attached
+                    // event lands.
+                    target.clear_page();
+                }
             }
         }
     }

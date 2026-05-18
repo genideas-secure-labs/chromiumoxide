@@ -139,6 +139,17 @@ impl Target {
         &mut self.session_id
     }
 
+    /// Drop the cached `PageHandle`.
+    ///
+    /// Called from the handler when a session detaches so that `get_page`
+    /// during the detach/reattach race window returns `CdpError::NotFound`
+    /// instead of a `PageHandle` bound to a dead session. The next
+    /// `attachedToTarget` event reseats `session_id`, and the next
+    /// `get_or_create_page` call rebuilds the handle from the fresh session.
+    pub(crate) fn clear_page(&mut self) {
+        self.page = None;
+    }
+
     /// The identifier for this target
     pub fn target_id(&self) -> &TargetId {
         &self.info.target_id
