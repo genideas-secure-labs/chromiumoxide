@@ -139,6 +139,17 @@ impl Target {
         &mut self.session_id
     }
 
+    /// Drop the cached `PageHandle`.
+    ///
+    /// Called from the handler when a session detaches so that `get_page`
+    /// during the detach/reattach race window returns `CdpError::NotFound`
+    /// instead of a `PageHandle` bound to a dead session. The next
+    /// `attachedToTarget` event reseats `session_id`, and the next
+    /// `get_or_create_page` call rebuilds the handle from the fresh session.
+    pub(crate) fn clear_page(&mut self) {
+        self.page = None;
+    }
+
     /// The identifier for this target
     pub fn target_id(&self) -> &TargetId {
         &self.info.target_id
@@ -160,12 +171,28 @@ impl Target {
     }
 
     fn create_page(&mut self) {
-        if self.page.is_none() {
-            if let Some(session) = self.session_id.clone() {
-                let handle =
-                    PageHandle::new(self.target_id().clone(), session, self.opener_id().cloned());
-                self.page = Some(handle);
-            }
+        // No active session → can't bind a PageHandle. Leave any stale cache
+        // in place; the next attach will trigger a rebuild via the mismatch
+        // check below.
+        let Some(session) = self.session_id.clone() else {
+            return;
+        };
+
+        // Rebuild the cached PageHandle when its session no longer matches
+        // the target's current session. This is what makes detach + reattach
+        // (or any session rotation) safe for callers: previously the first
+        // call to `get_or_create_page` cached a PageHandle bound to S1, and
+        // subsequent calls — even after S1 was torn down and S2 attached —
+        // kept returning the S1-bound handle, so every command came back
+        // with `Error -32001: Session with given id not found`.
+        let session_matches = self
+            .page
+            .as_ref()
+            .is_some_and(|p| p.inner().session_id() == &session);
+        if !session_matches {
+            let handle =
+                PageHandle::new(self.target_id().clone(), session, self.opener_id().cloned());
+            self.page = Some(handle);
         }
     }
 
@@ -328,6 +355,7 @@ impl Target {
             TargetInit::AttachToTarget => {
                 self.init_state = TargetInit::InitializingFrame(FrameManager::init_commands(
                     self.config.request_timeout,
+                    self.config.stealth_mode,
                 ));
                 let params = AttachToTargetParams::builder()
                     .target_id(self.target_id().clone())
@@ -345,10 +373,23 @@ impl Target {
                 if let Poll::Ready(poll) = cmds.poll(now) {
                     return match poll {
                         None => {
-                            if let Some(isolated_world_cmds) =
-                                self.frame_manager.ensure_isolated_world(UTILITY_WORLD_NAME)
-                            {
-                                *cmds = isolated_world_cmds;
+                            // Stealth: skip createIsolatedWorld — it's a debugger-only
+                            // artifact that reCAPTCHA can detect
+                            if !self.config.stealth_mode {
+                                if let Some(isolated_world_cmds) =
+                                    self.frame_manager.ensure_isolated_world(UTILITY_WORLD_NAME)
+                                {
+                                    *cmds = isolated_world_cmds;
+                                    return self.poll(cx, now);
+                                }
+                            }
+                            // Stealth: skip Network.enable unless request_intercept is needed
+                            if self.config.stealth_mode && !self.config.request_intercept {
+                                self.init_state =
+                                    TargetInit::InitializingPage(Self::page_init_commands(
+                                        self.config.request_timeout,
+                                        self.config.stealth_mode,
+                                    ));
                             } else {
                                 self.init_state = TargetInit::InitializingNetwork(
                                     self.network_manager.init_commands(),
@@ -374,7 +415,8 @@ impl Target {
                     now,
                     cmds,
                     TargetInit::InitializingPage(Self::page_init_commands(
-                        self.config.request_timeout
+                        self.config.request_timeout,
+                        self.config.stealth_mode,
                     ))
                 );
             }
@@ -568,29 +610,33 @@ impl Target {
         self.initiator = Some(tx);
     }
 
-    pub(crate) fn page_init_commands(timeout: Duration) -> CommandChain {
+    pub(crate) fn page_init_commands(timeout: Duration, stealth_mode: bool) -> CommandChain {
         let attach = SetAutoAttachParams::builder()
             .flatten(true)
             .auto_attach(true)
-            .wait_for_debugger_on_start(true)
+            // Stealth: don't pause child targets on start — reduces debugger fingerprint
+            .wait_for_debugger_on_start(!stealth_mode)
             .build()
             .unwrap();
-        let enable_performance = performance::EnableParams::default();
-        let enable_log = cdplog::EnableParams::default();
-        CommandChain::new(
-            vec![
-                (attach.identifier(), serde_json::to_value(attach).unwrap()),
-                (
-                    enable_performance.identifier(),
-                    serde_json::to_value(enable_performance).unwrap(),
-                ),
-                (
-                    enable_log.identifier(),
-                    serde_json::to_value(enable_log).unwrap(),
-                ),
-            ],
-            timeout,
-        )
+
+        let mut cmds = vec![(attach.identifier(), serde_json::to_value(attach).unwrap())];
+
+        // Stealth: skip Performance.enable and Log.enable — pure detection vectors
+        // with no functional value for automation
+        if !stealth_mode {
+            let enable_performance = performance::EnableParams::default();
+            let enable_log = cdplog::EnableParams::default();
+            cmds.push((
+                enable_performance.identifier(),
+                serde_json::to_value(enable_performance).unwrap(),
+            ));
+            cmds.push((
+                enable_log.identifier(),
+                serde_json::to_value(enable_log).unwrap(),
+            ));
+        }
+
+        CommandChain::new(cmds, timeout)
     }
 }
 
@@ -602,6 +648,8 @@ pub struct TargetConfig {
     pub viewport: Option<Viewport>,
     pub request_intercept: bool,
     pub cache_enabled: bool,
+    /// Stealth mode: minimize CDP domain enables to reduce bot detection footprint.
+    pub stealth_mode: bool,
 }
 
 impl Default for TargetConfig {
@@ -612,6 +660,7 @@ impl Default for TargetConfig {
             viewport: Default::default(),
             request_intercept: false,
             cache_enabled: true,
+            stealth_mode: false,
         }
     }
 }

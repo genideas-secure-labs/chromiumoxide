@@ -211,30 +211,36 @@ impl FrameManager {
         }
     }
 
-    /// The commands to execute in order to initialize this frame manager
-    pub fn init_commands(timeout: Duration) -> CommandChain {
+    /// The commands to execute in order to initialize this frame manager.
+    /// The `_stealth_mode` parameter is reserved for future per-command control.
+    pub fn init_commands(timeout: Duration, _stealth_mode: bool) -> CommandChain {
         let enable = page::EnableParams::default();
         let get_tree = page::GetFrameTreeParams::default();
-        let set_lifecycle = page::SetLifecycleEventsEnabledParams::new(true);
         let enable_runtime = runtime::EnableParams::default();
-        CommandChain::new(
-            vec![
-                (enable.identifier(), serde_json::to_value(enable).unwrap()),
-                (
-                    get_tree.identifier(),
-                    serde_json::to_value(get_tree).unwrap(),
-                ),
-                (
-                    set_lifecycle.identifier(),
-                    serde_json::to_value(set_lifecycle).unwrap(),
-                ),
-                (
-                    enable_runtime.identifier(),
-                    serde_json::to_value(enable_runtime).unwrap(),
-                ),
-            ],
-            timeout,
-        )
+
+        let mut cmds = vec![
+            (enable.identifier(), serde_json::to_value(enable).unwrap()),
+            (
+                get_tree.identifier(),
+                serde_json::to_value(get_tree).unwrap(),
+            ),
+        ];
+
+        // Note: Page.setLifecycleEventsEnabled is required for goto() wait_until
+        // detection. Keeping it even in stealth mode — it's a minor signal compared
+        // to Performance/Log/Network enables.
+        let set_lifecycle = page::SetLifecycleEventsEnabledParams::new(true);
+        cmds.push((
+            set_lifecycle.identifier(),
+            serde_json::to_value(set_lifecycle).unwrap(),
+        ));
+
+        cmds.push((
+            enable_runtime.identifier(),
+            serde_json::to_value(enable_runtime).unwrap(),
+        ));
+
+        CommandChain::new(cmds, timeout)
     }
 
     pub fn main_frame(&self) -> Option<&Frame> {
