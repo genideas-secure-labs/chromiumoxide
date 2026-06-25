@@ -373,7 +373,14 @@ impl BrowserConfig {
         if self.disable_default_args {
             builder.args(self.args.clone());
         } else {
-            builder.args(DEFAULT_ARGS.clone()).args(self.args.clone());
+            // User/config args first, then fill in DEFAULT_ARGS only for keys
+            // the user did NOT set. This makes an explicit arg (e.g.
+            // `lang=ko-KR`) REPLACE the matching default (`lang=en_US`) instead
+            // of merging into `--lang=en_US,ko-KR`. Mirrors the `has()`-gated
+            // `remote-debugging-port` default below.
+            builder
+                .args(self.args.clone())
+                .arg_defaults(DEFAULT_ARGS.clone());
         }
 
         if !builder.has("remote-debugging-port") {
