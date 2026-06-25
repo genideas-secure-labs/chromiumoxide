@@ -25,7 +25,7 @@ use crate::layout::{BoundingBox, BoxModel, ElementQuad, Point};
 use crate::utils;
 
 /// Represents a [DOM Element](https://developer.mozilla.org/en-US/docs/Web/API/Element).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Element {
     /// The Unique object identifier
     pub remote_object_id: RemoteObjectId,
