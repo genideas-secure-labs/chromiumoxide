@@ -152,12 +152,12 @@ impl Page {
                 });
                 Object.defineProperty(fakePlugins, 'length', { value: plugins.length, enumerable: true });
                 // Add methods
-                Object.defineProperty(fakePlugins, 'item', { 
+                Object.defineProperty(fakePlugins, 'item', {
                     value: function(index) { return this[index] || null; },
                     enumerable: false
                 });
-                Object.defineProperty(fakePlugins, 'namedItem', { 
-                    value: function(name) { 
+                Object.defineProperty(fakePlugins, 'namedItem', {
+                    value: function(name) {
                         for (let i = 0; i < this.length; i++) {
                             if (this[i].name === name) return this[i];
                         }
@@ -166,7 +166,7 @@ impl Page {
                     enumerable: false
                 });
 
-                Object.defineProperty(fakePlugins, 'refresh', { 
+                Object.defineProperty(fakePlugins, 'refresh', {
                     value: function() {},
                     enumerable: false
                 });
@@ -1398,7 +1398,7 @@ pub(crate) fn validate_cookie_url(url: &str) -> Result<()> {
 }
 
 /// Page screenshot parameters with extra options.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ScreenshotParams {
     /// Chrome DevTools Protocol screenshot options.
     pub cdp_params: CaptureScreenshotParams,
@@ -1428,7 +1428,7 @@ impl ScreenshotParams {
 }
 
 /// Page screenshot parameters builder with extra options.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ScreenshotParamsBuilder {
     cdp_params: CaptureScreenshotParams,
     full_page: Option<bool>,
