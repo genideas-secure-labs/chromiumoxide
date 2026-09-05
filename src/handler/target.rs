@@ -127,6 +127,16 @@ impl Target {
         self.session_id = Some(id)
     }
 
+    /// Refresh the target's metadata in place.
+    ///
+    /// `Target.targetInfoChanged` is not handled by this crate, and target
+    /// discovery deliberately does not replace a live `Target`, so this is the
+    /// only path that keeps `info()` from freezing at its first snapshot.
+    /// Session, page and frame state are untouched.
+    pub fn set_info(&mut self, info: TargetInfo) {
+        self.info = info;
+    }
+
     pub fn session_id(&self) -> Option<&SessionId> {
         self.session_id.as_ref()
     }

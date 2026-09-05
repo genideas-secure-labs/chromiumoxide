@@ -453,8 +453,30 @@ impl Handler {
         // a fake CDP server: two `Target.getTargets` responses produced two
         // `Target.attachToTarget` calls for the same target before this guard,
         // one after.
-        if self.targets.contains_key(&event.target_info.target_id) {
-            return;
+        //
+        // "Already tracked" is NOT the same as "healthy", so the guard is not
+        // simply `contains_key`. CDP may detach a session "for any reason", and
+        // `on_detached_from_target` clears `session_id` for the current one —
+        // leaving a target that finished initializing and can no longer make
+        // progress, because `Target::poll` needs a session. Re-discovery was
+        // the (accidental) way back from that, so it stays the way back: a
+        // target that is `Initialized` with no session is replaced. Everything
+        // else is left alone, including an attach still in flight
+        // (`InitializingFrame` with no session yet) — replacing that is exactly
+        // the double-attach this guard exists to prevent.
+        //
+        // The init-failure path does not need this: `on_initialization_failed`
+        // moves the target to `Closing` and sends `Target.closeTarget`, and the
+        // resulting `targetDestroyed` removes the entry outright.
+        if let Some(existing) = self.targets.get_mut(&event.target_info.target_id) {
+            let stranded = existing.is_initialized() && existing.session_id().is_none();
+            if !stranded {
+                // Keep the live target, but do not let its metadata freeze at
+                // the first snapshot — this crate does not handle
+                // `Target.targetInfoChanged`, so discovery is the only refresh.
+                existing.set_info(event.target_info);
+                return;
+            }
         }
         let browser_ctx = event
             .target_info
