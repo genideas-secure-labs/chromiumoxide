@@ -442,6 +442,20 @@ impl Handler {
     ///
     /// Creates a new `Target` instance and keeps track of it
     fn on_target_created(&mut self, event: EventTargetCreated) {
+        // Target discovery is not idempotent unless this returns early.
+        // `Browser::fetch_targets()` funnels every `TargetInfo` it gets back
+        // through here, so a second fetch used to REPLACE a live `Target` with
+        // a fresh one in `TargetInit::AttachToTarget` — throwing away its
+        // session, its `Page`, and its `FrameManager`, and opening yet another
+        // session on the same target. Screen-play re-fetches on ordinary paths
+        // (`connect`, `find_page_by_url`, `active_page`, `wait_for_popup`), so
+        // that was reachable in normal use, not just at startup. Measured with
+        // a fake CDP server: two `Target.getTargets` responses produced two
+        // `Target.attachToTarget` calls for the same target before this guard,
+        // one after.
+        if self.targets.contains_key(&event.target_info.target_id) {
+            return;
+        }
         let browser_ctx = event
             .target_info
             .browser_context_id
