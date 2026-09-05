@@ -219,15 +219,35 @@ impl Handler {
                             let targets: Vec<TargetInfo> = resp.result.target_infos;
                             let results = targets.clone();
                             for target_info in targets {
-                                let target_id = target_info.target_id.clone();
                                 let event: EventTargetCreated = EventTargetCreated { target_info };
                                 self.on_target_created(event);
-                                let attach = AttachToTargetParams::new(target_id);
-                                let _ = self.conn.submit_command(
-                                    attach.identifier(),
-                                    None,
-                                    serde_json::to_value(attach).unwrap(),
-                                );
+                                // Do NOT attach here. `Target::poll` already sends
+                                // `Target.attachToTarget { flatten: true }` for every
+                                // page target it tracks, so this was a second attach on
+                                // the same target — and an UN-flattened one. Chrome then
+                                // delivers that session's events wrapped in
+                                // `Target.receivedMessageFromTarget`, which this crate
+                                // does not handle, so they were dropped; and which of
+                                // the two sessions the `Target` ended up bound to (via
+                                // `on_attached_to_target`) was a race.
+                                //
+                                // When the race was lost, `Page.enable` came back
+                                // "Session with given id not found." — and because
+                                // `Target::on_response` advances the init `CommandChain`
+                                // regardless of the response's error, the target still
+                                // reported `Initialized`. No Page/lifecycle events ever
+                                // reached its `FrameManager` after that, so a later
+                                // `Page.goto` never had its navigation marked complete
+                                // and failed with `CdpError::Timeout` after 30s — even
+                                // though the page had navigated perfectly well.
+                                //
+                                // Measured on Linux/Chromium 141, screen-play-rs #1026
+                                // (`Browser::connect` to a Chrome launched with a URL in
+                                // argv, then `page.goto(other_url)`), 8 runs per cell:
+                                //   as-shipped .......................... 4/8 ok
+                                //   skip the clobber in on_target_created  0/8 ok
+                                //   attach here, but flattened ........... 3/8 ok
+                                //   no attach here (this change) ......... 8/8 ok
                             }
 
                             let _ = tx.send(Ok(results)).ok();
