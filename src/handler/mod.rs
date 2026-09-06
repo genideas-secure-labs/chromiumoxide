@@ -474,7 +474,7 @@ impl Handler {
                 // Keep the live target, but do not let its metadata freeze at
                 // the first snapshot — this crate does not handle
                 // `Target.targetInfoChanged`, so discovery is the only refresh.
-                existing.set_info(event.target_info);
+                existing.refresh_metadata(&event.target_info);
                 return;
             }
         }

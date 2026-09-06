@@ -127,14 +127,23 @@ impl Target {
         self.session_id = Some(id)
     }
 
-    /// Refresh the target's metadata in place.
+    /// Refresh the metadata that can legitimately change while a target lives.
     ///
     /// `Target.targetInfoChanged` is not handled by this crate, and target
     /// discovery deliberately does not replace a live `Target`, so this is the
     /// only path that keeps `info()` from freezing at its first snapshot.
     /// Session, page and frame state are untouched.
-    pub fn set_info(&mut self, info: TargetInfo) {
-        self.info = info;
+    ///
+    /// Deliberately narrow: only `title` and `url` are copied. `type`,
+    /// `browser_context_id` and `opener_id` are read elsewhere as if they were
+    /// fixed for the life of the target — `r#type` is mirrored into
+    /// `self.r#type` at construction and `opener_id` is copied into the
+    /// `PageHandle` — so overwriting the whole struct could make `info().type`
+    /// disagree with `is_page()`, or leave a `Page::opener_id` that no longer
+    /// matches `info()`.
+    pub fn refresh_metadata(&mut self, info: &TargetInfo) {
+        self.info.title.clone_from(&info.title);
+        self.info.url.clone_from(&info.url);
     }
 
     pub fn session_id(&self) -> Option<&SessionId> {
