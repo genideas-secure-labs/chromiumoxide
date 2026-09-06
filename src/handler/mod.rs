@@ -442,41 +442,25 @@ impl Handler {
     ///
     /// Creates a new `Target` instance and keeps track of it
     fn on_target_created(&mut self, event: EventTargetCreated) {
-        // Target discovery is not idempotent unless this returns early.
-        // `Browser::fetch_targets()` funnels every `TargetInfo` it gets back
-        // through here, so a second fetch used to REPLACE a live `Target` with
-        // a fresh one in `TargetInit::AttachToTarget` — throwing away its
-        // session, its `Page`, and its `FrameManager`, and opening yet another
-        // session on the same target. Screen-play re-fetches on ordinary paths
-        // (`connect`, `find_page_by_url`, `active_page`, `wait_for_popup`), so
-        // that was reachable in normal use, not just at startup. Measured with
-        // a fake CDP server: two `Target.getTargets` responses produced two
-        // `Target.attachToTarget` calls for the same target before this guard,
-        // one after.
+        // Discovery registers, it does not repair. `Browser::fetch_targets()`
+        // funnels every `TargetInfo` it gets back through here, so replacing a
+        // tracked `Target` would throw away its session, its `Page` and its
+        // `FrameManager` and make `Target::poll` open a second session on the
+        // same target — measured with a fake CDP server as two
+        // `Target.attachToTarget` calls for two `Target.getTargets` answers.
+        // Screen-play re-discovers on ordinary paths (`connect`,
+        // `find_page_by_url`, `active_page`, `wait_for_popup`), so that was
+        // reachable in normal use, not just at startup.
         //
-        // "Already tracked" is NOT the same as "healthy", so the guard is not
-        // simply `contains_key`. CDP may detach a session "for any reason", and
-        // `on_detached_from_target` clears `session_id` for the current one —
-        // leaving a target that finished initializing and can no longer make
-        // progress, because `Target::poll` needs a session. Re-discovery was
-        // the (accidental) way back from that, so it stays the way back: a
-        // target that is `Initialized` with no session is replaced. Everything
-        // else is left alone, including an attach still in flight
-        // (`InitializingFrame` with no session yet) — replacing that is exactly
-        // the double-attach this guard exists to prevent.
-        //
-        // The init-failure path does not need this: `on_initialization_failed`
-        // moves the target to `Closing` and sends `Target.closeTarget`, and the
-        // resulting `targetDestroyed` removes the entry outright.
+        // Recovery from a lost session belongs to `on_detached_from_target`,
+        // which re-arms the target directly. Keeping it there is what lets this
+        // function stay a plain "register if unknown" with no notion of target
+        // health — every attempt to infer health here needed another special
+        // case for another state (`Initialized` with no session, then
+        // `InitializingFrame` with no session, ...).
         if let Some(existing) = self.targets.get_mut(&event.target_info.target_id) {
-            let stranded = existing.is_initialized() && existing.session_id().is_none();
-            if !stranded {
-                // Keep the live target, but do not let its metadata freeze at
-                // the first snapshot — this crate does not handle
-                // `Target.targetInfoChanged`, so discovery is the only refresh.
-                existing.set_info(event.target_info);
-                return;
-            }
+            existing.refresh_metadata(&event.target_info);
+            return;
         }
         let browser_ctx = event
             .target_info
@@ -541,6 +525,13 @@ impl Handler {
                     // as a retryable signal until the next attached
                     // event lands.
                     target.clear_page();
+                    // Put it back in line for a fresh session. Without this the
+                    // target is stuck: every initializing state of
+                    // `Target::poll` returns early without a session, and an
+                    // `Initialized` one has nothing left to send. CDP may
+                    // detach "for any reason", so this is a normal event, not
+                    // an error path.
+                    target.rearm_for_reattach();
                 }
             }
         }
