@@ -134,16 +134,22 @@ impl Target {
     /// only path that keeps `info()` from freezing at its first snapshot.
     /// Session, page and frame state are untouched.
     ///
-    /// Deliberately narrow: only `title` and `url` are copied. `type`,
-    /// `browser_context_id` and `opener_id` are read elsewhere as if they were
-    /// fixed for the life of the target — `r#type` is mirrored into
-    /// `self.r#type` at construction and `opener_id` is copied into the
-    /// `PageHandle` — so overwriting the whole struct could make `info().type`
-    /// disagree with `is_page()`, or leave a `Page::opener_id` that no longer
-    /// matches `info()`.
+    /// Deliberately narrow, and narrow by field rather than by wholesale
+    /// replacement: `type`, `browser_context_id` and `opener_id` are read
+    /// elsewhere as if they were fixed for the life of the target — `r#type` is
+    /// mirrored into `self.r#type` at construction and `opener_id` is copied
+    /// into the `PageHandle` — so overwriting the whole struct could make
+    /// `info().type` disagree with `is_page()`, or leave a `Page::opener_id`
+    /// that no longer matches `info()`.
+    ///
+    /// `attached` IS refreshed: it genuinely flips false -> true once a session
+    /// is opened, it has no cached mirror, and leaving it stale would make
+    /// `info().attached` contradict the snapshot it was just refreshed from.
+    /// Nothing in this crate reads it today, but `info()` is public.
     pub fn refresh_metadata(&mut self, info: &TargetInfo) {
         self.info.title.clone_from(&info.title);
         self.info.url.clone_from(&info.url);
+        self.info.attached = info.attached;
     }
 
     pub fn session_id(&self) -> Option<&SessionId> {
