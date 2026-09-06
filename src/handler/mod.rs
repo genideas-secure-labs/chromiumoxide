@@ -497,33 +497,40 @@ impl Handler {
             },
             browser_ctx,
         );
-        // Only schedule an ID that is not scheduled yet. Reaching here with the
-        // target already in `self.targets` means the revival path above fell
+        // Only schedule an ID that is not scheduled yet. Reaching here for a
+        // target that already has an entry means the revival path above fell
         // through, and that entry's ID is already in `target_ids` — pushing
         // unconditionally would leave a DUPLICATE, permanently: the poll loop
         // re-pushes whatever it finds, so every later tick would poll that
         // target once per copy and every further detach/revival would add
-        // another. `contains_key` is a sound test for "already scheduled" here
-        // because `on_target_created` is only ever reached from `on_response` /
-        // `on_event`, both of which run OUTSIDE the loop that temporarily takes
-        // a target out of the map. Found by review round 7.
+        // another. Found by review round 7.
+        //
+        // The gate is `target_ids` itself, and that correction is round 8's.
+        // Round 7 gated on `self.targets` and asserted the two were the same
+        // set. They are NOT: `on_target_destroyed` removes from `targets`
+        // ONLY, and the id stays in `target_ids` until the poll loop next
+        // fails to find it and drops it. So after any destruction the two
+        // legitimately diverge — and a target destroyed and rediscovered
+        // before that sweep would have pushed a duplicate anyway (release) or
+        // tripped the assertion (debug). Asking the scheduler's own list
+        // whether this id is scheduled needs no cross-container invariant, and
+        // it closes the destroy-then-rediscover case that predates round 7.
         let target_id = target.target_id().clone();
-        if !self.targets.contains_key(&target_id) {
-            // The invariant, stated where it can be checked: membership in
-            // `targets` and membership in `target_ids` are the same thing.
-            // `debug_assert!` rather than a comment because it then runs in
-            // every downstream debug test build — screen-play-rs#1026's
-            // protocol tests exercise the revival path on every `cargo test`,
-            // and this defect is invisible from the wire, so a claim is all a
-            // comment could ever be.
-            debug_assert!(
-                !self.target_ids.contains(&target_id),
-                "target {target_id:?} is absent from `targets` but already in `target_ids`; \
-                 scheduling it again would poll it once per copy, forever"
-            );
+        if !self.target_ids.contains(&target_id) {
             self.target_ids.push(target_id.clone());
         }
-        self.targets.insert(target_id, target);
+        self.targets.insert(target_id.clone(), target);
+        // The property that actually matters, checked after the fact rather
+        // than assumed: a duplicate here is permanent, because the poll loop
+        // re-pushes whatever it finds. `debug_assert!` so it runs in every
+        // downstream debug test build — screen-play-rs#1026's protocol tests
+        // drive this path on every `cargo test`, and the defect is invisible
+        // from the wire, so a comment could never be more than a claim.
+        debug_assert_eq!(
+            self.target_ids.iter().filter(|id| **id == target_id).count(),
+            1,
+            "target {target_id:?} must appear in `target_ids` exactly once"
+        );
     }
 
     /// A new session is attached to a target
