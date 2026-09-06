@@ -142,14 +142,27 @@ impl Target {
     /// `info().type` disagree with `is_page()`, or leave a `Page::opener_id`
     /// that no longer matches `info()`.
     ///
-    /// `attached` IS refreshed: it genuinely flips false -> true once a session
-    /// is opened, it has no cached mirror, and leaving it stale would make
-    /// `info().attached` contradict the snapshot it was just refreshed from.
-    /// Nothing in this crate reads it today, but `info()` is public.
+    /// The rule is therefore complete rather than a list of favourites: every
+    /// field that has NO cached mirror is refreshed, and only the mirrored ones
+    /// (`type`, `opener_id`, `browser_context_id`) plus the identity
+    /// (`target_id`, which is this entry's map key) are left alone. Enumerated
+    /// against the CDP `Target.TargetInfo` definition rather than from memory —
+    /// review round 7 named two stale fields and the protocol has four.
+    ///
+    /// Failing safe was the deliberate choice over `self.info = info.clone()`:
+    /// if upstream adds a field, this leaves it stale, whereas wholesale
+    /// replacement would silently overwrite a future mirrored field and put
+    /// `info()` back out of step with the cached copy — which is the desync
+    /// that made round 4 revert an earlier attempt.
     pub fn refresh_metadata(&mut self, info: &TargetInfo) {
         self.info.title.clone_from(&info.title);
         self.info.url.clone_from(&info.url);
+        // Genuinely flips false -> true once a session is opened.
         self.info.attached = info.attached;
+        self.info.can_access_opener = info.can_access_opener;
+        self.info.opener_frame_id.clone_from(&info.opener_frame_id);
+        self.info.parent_frame_id.clone_from(&info.parent_frame_id);
+        self.info.subtype.clone_from(&info.subtype);
     }
 
     pub fn session_id(&self) -> Option<&SessionId> {

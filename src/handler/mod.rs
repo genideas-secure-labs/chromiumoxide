@@ -497,8 +497,33 @@ impl Handler {
             },
             browser_ctx,
         );
-        self.target_ids.push(target.target_id().clone());
-        self.targets.insert(target.target_id().clone(), target);
+        // Only schedule an ID that is not scheduled yet. Reaching here with the
+        // target already in `self.targets` means the revival path above fell
+        // through, and that entry's ID is already in `target_ids` — pushing
+        // unconditionally would leave a DUPLICATE, permanently: the poll loop
+        // re-pushes whatever it finds, so every later tick would poll that
+        // target once per copy and every further detach/revival would add
+        // another. `contains_key` is a sound test for "already scheduled" here
+        // because `on_target_created` is only ever reached from `on_response` /
+        // `on_event`, both of which run OUTSIDE the loop that temporarily takes
+        // a target out of the map. Found by review round 7.
+        let target_id = target.target_id().clone();
+        if !self.targets.contains_key(&target_id) {
+            // The invariant, stated where it can be checked: membership in
+            // `targets` and membership in `target_ids` are the same thing.
+            // `debug_assert!` rather than a comment because it then runs in
+            // every downstream debug test build — screen-play-rs#1026's
+            // protocol tests exercise the revival path on every `cargo test`,
+            // and this defect is invisible from the wire, so a claim is all a
+            // comment could ever be.
+            debug_assert!(
+                !self.target_ids.contains(&target_id),
+                "target {target_id:?} is absent from `targets` but already in `target_ids`; \
+                 scheduling it again would poll it once per copy, forever"
+            );
+            self.target_ids.push(target_id.clone());
+        }
+        self.targets.insert(target_id, target);
     }
 
     /// A new session is attached to a target
