@@ -127,35 +127,14 @@ impl Target {
         self.session_id = Some(id)
     }
 
-    /// Refresh the metadata that can legitimately change while a target lives.
+    /// Refresh the target's metadata in place.
     ///
     /// `Target.targetInfoChanged` is not handled by this crate, and target
-    /// discovery does not replace a live `Target`, so this is the only path
-    /// that keeps `info()` from freezing at its first snapshot.
-    ///
-    /// Deliberately narrow: only `title` and `url` are copied. `type`,
-    /// `browser_context_id` and `opener_id` are read elsewhere as if they were
-    /// fixed for the life of the target — `r#type` in particular is mirrored
-    /// into `self.r#type` at construction — so overwriting the whole struct
-    /// could make `info().type` and `is_page()` disagree.
-    pub fn refresh_metadata(&mut self, info: &TargetInfo) {
-        self.info.title.clone_from(&info.title);
-        self.info.url.clone_from(&info.url);
-    }
-
-    /// Put the target back in line for a fresh session.
-    ///
-    /// A target whose session went away cannot make progress on its own:
-    /// `Target::poll` needs a session in every initializing state, and an
-    /// `Initialized` target has nothing left to send. Re-arming resets the init
-    /// state machine so the next `poll` sends `Target.attachToTarget` again and
-    /// replays the init chain on the new session.
-    ///
-    /// This is what makes recovery the responsibility of the thing that lost
-    /// the session, instead of something an unrelated `Target.getTargets` call
-    /// has to notice and repair.
-    pub fn rearm_for_reattach(&mut self) {
-        self.init_state = TargetInit::AttachToTarget;
+    /// discovery deliberately does not replace a live `Target`, so this is the
+    /// only path that keeps `info()` from freezing at its first snapshot.
+    /// Session, page and frame state are untouched.
+    pub fn set_info(&mut self, info: TargetInfo) {
+        self.info = info;
     }
 
     pub fn session_id(&self) -> Option<&SessionId> {
