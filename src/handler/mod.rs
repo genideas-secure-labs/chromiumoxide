@@ -219,15 +219,35 @@ impl Handler {
                             let targets: Vec<TargetInfo> = resp.result.target_infos;
                             let results = targets.clone();
                             for target_info in targets {
-                                let target_id = target_info.target_id.clone();
                                 let event: EventTargetCreated = EventTargetCreated { target_info };
                                 self.on_target_created(event);
-                                let attach = AttachToTargetParams::new(target_id);
-                                let _ = self.conn.submit_command(
-                                    attach.identifier(),
-                                    None,
-                                    serde_json::to_value(attach).unwrap(),
-                                );
+                                // Do NOT attach here. `Target::poll` already sends
+                                // `Target.attachToTarget { flatten: true }` for every
+                                // page target it tracks, so this was a second attach on
+                                // the same target — and an UN-flattened one. Chrome then
+                                // delivers that session's events wrapped in
+                                // `Target.receivedMessageFromTarget`, which this crate
+                                // does not handle, so they were dropped; and which of
+                                // the two sessions the `Target` ended up bound to (via
+                                // `on_attached_to_target`) was a race.
+                                //
+                                // When the race was lost, `Page.enable` came back
+                                // "Session with given id not found." — and because
+                                // `Target::on_response` advances the init `CommandChain`
+                                // regardless of the response's error, the target still
+                                // reported `Initialized`. No Page/lifecycle events ever
+                                // reached its `FrameManager` after that, so a later
+                                // `Page.goto` never had its navigation marked complete
+                                // and failed with `CdpError::Timeout` after 30s — even
+                                // though the page had navigated perfectly well.
+                                //
+                                // Measured on Linux/Chromium 141, screen-play-rs #1026
+                                // (`Browser::connect` to a Chrome launched with a URL in
+                                // argv, then `page.goto(other_url)`), 8 runs per cell:
+                                //   as-shipped .......................... 4/8 ok
+                                //   skip the clobber in on_target_created  0/8 ok
+                                //   attach here, but flattened ........... 3/8 ok
+                                //   no attach here (this change) ......... 8/8 ok
                             }
 
                             let _ = tx.send(Ok(results)).ok();
@@ -422,6 +442,42 @@ impl Handler {
     ///
     /// Creates a new `Target` instance and keeps track of it
     fn on_target_created(&mut self, event: EventTargetCreated) {
+        // Target discovery is not idempotent unless this returns early.
+        // `Browser::fetch_targets()` funnels every `TargetInfo` it gets back
+        // through here, so a second fetch used to REPLACE a live `Target` with
+        // a fresh one in `TargetInit::AttachToTarget` — throwing away its
+        // session, its `Page`, and its `FrameManager`, and opening yet another
+        // session on the same target. Screen-play re-fetches on ordinary paths
+        // (`connect`, `find_page_by_url`, `active_page`, `wait_for_popup`), so
+        // that was reachable in normal use, not just at startup. Measured with
+        // a fake CDP server: two `Target.getTargets` responses produced two
+        // `Target.attachToTarget` calls for the same target before this guard,
+        // one after.
+        //
+        // "Already tracked" is NOT the same as "healthy", so the guard is not
+        // simply `contains_key`. CDP may detach a session "for any reason", and
+        // `on_detached_from_target` clears `session_id` for the current one —
+        // leaving a target that finished initializing and can no longer make
+        // progress, because `Target::poll` needs a session. Re-discovery was
+        // the (accidental) way back from that, so it stays the way back: a
+        // target that is `Initialized` with no session is replaced. Everything
+        // else is left alone, including an attach still in flight
+        // (`InitializingFrame` with no session yet) — replacing that is exactly
+        // the double-attach this guard exists to prevent.
+        //
+        // The init-failure path does not need this: `on_initialization_failed`
+        // moves the target to `Closing` and sends `Target.closeTarget`, and the
+        // resulting `targetDestroyed` removes the entry outright.
+        if let Some(existing) = self.targets.get_mut(&event.target_info.target_id) {
+            let stranded = existing.is_initialized() && existing.session_id().is_none();
+            if !stranded {
+                // Keep the live target, but do not let its metadata freeze at
+                // the first snapshot — this crate does not handle
+                // `Target.targetInfoChanged`, so discovery is the only refresh.
+                existing.refresh_metadata(&event.target_info);
+                return;
+            }
+        }
         let browser_ctx = event
             .target_info
             .browser_context_id
@@ -441,8 +497,40 @@ impl Handler {
             },
             browser_ctx,
         );
-        self.target_ids.push(target.target_id().clone());
-        self.targets.insert(target.target_id().clone(), target);
+        // Only schedule an ID that is not scheduled yet. Reaching here for a
+        // target that already has an entry means the revival path above fell
+        // through, and that entry's ID is already in `target_ids` — pushing
+        // unconditionally would leave a DUPLICATE, permanently: the poll loop
+        // re-pushes whatever it finds, so every later tick would poll that
+        // target once per copy and every further detach/revival would add
+        // another. Found by review round 7.
+        //
+        // The gate is `target_ids` itself, and that correction is round 8's.
+        // Round 7 gated on `self.targets` and asserted the two were the same
+        // set. They are NOT: `on_target_destroyed` removes from `targets`
+        // ONLY, and the id stays in `target_ids` until the poll loop next
+        // fails to find it and drops it. So after any destruction the two
+        // legitimately diverge — and a target destroyed and rediscovered
+        // before that sweep would have pushed a duplicate anyway (release) or
+        // tripped the assertion (debug). Asking the scheduler's own list
+        // whether this id is scheduled needs no cross-container invariant, and
+        // it closes the destroy-then-rediscover case that predates round 7.
+        let target_id = target.target_id().clone();
+        if !self.target_ids.contains(&target_id) {
+            self.target_ids.push(target_id.clone());
+        }
+        self.targets.insert(target_id.clone(), target);
+        // The property that actually matters, checked after the fact rather
+        // than assumed: a duplicate here is permanent, because the poll loop
+        // re-pushes whatever it finds. `debug_assert!` so it runs in every
+        // downstream debug test build — screen-play-rs#1026's protocol tests
+        // drive this path on every `cargo test`, and the defect is invisible
+        // from the wire, so a comment could never be more than a claim.
+        debug_assert_eq!(
+            self.target_ids.iter().filter(|id| **id == target_id).count(),
+            1,
+            "target {target_id:?} must appear in `target_ids` exactly once"
+        );
     }
 
     /// A new session is attached to a target
