@@ -527,7 +527,10 @@ impl Handler {
         // drive this path on every `cargo test`, and the defect is invisible
         // from the wire, so a comment could never be more than a claim.
         debug_assert_eq!(
-            self.target_ids.iter().filter(|id| **id == target_id).count(),
+            self.target_ids
+                .iter()
+                .filter(|id| **id == target_id)
+                .count(),
             1,
             "target {target_id:?} must appear in `target_ids` exactly once"
         );
