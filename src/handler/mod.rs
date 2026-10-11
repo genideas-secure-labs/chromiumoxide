@@ -433,6 +433,10 @@ impl Handler {
         if let Some(ref session_id) = event.session_id {
             if let Some(session) = self.sessions.get(session_id.as_str()) {
                 if let Some(target) = self.targets.get_mut(session.target_id()) {
+                    if !target.accepts_event_from(session_id) {
+                        // A superseded session's late event (#1041, codex R7).
+                        return;
+                    }
                     return target.on_event(event);
                 }
             }

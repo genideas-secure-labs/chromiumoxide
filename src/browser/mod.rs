@@ -457,15 +457,31 @@ impl Browser {
         let (tx, rx) = oneshot_channel();
         self.sender
             .clone()
-            .send(HandlerMessage::SetDesiredAttachment(target_id, false, tx))
+            .send(HandlerMessage::SetDesiredAttachment(
+                target_id.clone(),
+                false,
+                tx,
+            ))
             .await?;
         if let Some(session_id) = rx.await? {
-            self.execute(
-                crate::cdp::browser_protocol::target::DetachFromTargetParams::builder()
-                    .session_id(session_id)
-                    .build(),
-            )
-            .await?;
+            let detached = self
+                .execute(
+                    crate::cdp::browser_protocol::target::DetachFromTargetParams::builder()
+                        .session_id(session_id)
+                        .build(),
+                )
+                .await;
+            if let Err(err) = detached {
+                // Still attached: say so, so a `reattach_target` waiting for
+                // the detach to land is answered (codex R7).
+                let (tx, rx) = oneshot_channel();
+                self.sender
+                    .clone()
+                    .send(HandlerMessage::SetDesiredAttachment(target_id, true, tx))
+                    .await?;
+                let _ = rx.await;
+                return Err(err);
+            }
         }
         Ok(())
     }
