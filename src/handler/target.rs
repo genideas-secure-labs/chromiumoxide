@@ -307,6 +307,15 @@ impl Target {
         !old_session && !old_attempt
     }
 
+    /// An intentional detach of `session` failed (see `Handler::on_detach_failed`):
+    /// only if it is still this target's session and that detach is still
+    /// the pending decision is the target attached after all.
+    pub(crate) fn on_detach_failed(&mut self, session: &str) {
+        if self.detach_pending && self.session_id.as_ref().map(|s| s.as_ref()) == Some(session) {
+            self.set_desired_attached(true);
+        }
+    }
+
     /// Whether an event that arrived on `session` belongs to this target now:
     /// only its current session's do. A failed or replaced session can still
     /// deliver buffered events until its detach is acknowledged — a late
@@ -2305,7 +2314,7 @@ mod session_recovery_tests {
         t.set_desired_attached(false);
         let (tx, mut rx) = futures::channel::oneshot::channel();
         t.reattach(Instant::now(), tx);
-        t.set_desired_attached(true); // Browser::detach_target's detach failed
+        t.on_detach_failed("S1"); // Browser::detach_target's detach failed
         match rx.try_recv() {
             Ok(Some(Ok(page))) => assert_eq!(page.session_id().as_ref(), "S1"),
             other => panic!("expected the live session's page, got {other:?}"),
@@ -2341,7 +2350,7 @@ mod session_recovery_tests {
         t.set_desired_attached(false);
         let (tx, mut rx) = futures::channel::oneshot::channel();
         t.reattach(Instant::now(), tx);
-        t.set_desired_attached(true); // the detach failed
+        t.on_detach_failed("S1"); // the detach failed
         assert!(
             matches!(rx.try_recv(), Ok(None)),
             "not before it is initialized"
@@ -2357,5 +2366,27 @@ mod session_recovery_tests {
             Ok(Some(Ok(page))) => assert_eq!(page.session_id().as_ref(), "S1"),
             other => panic!("expected the initialized page, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_failed_detach_does_not_undo_one_that_succeeded() {
+        // codex R9: two overlapping detaches of the same session — one ends
+        // it, the other then fails because it is gone. The failure must not
+        // put the target back to "should be attached".
+        let mut t = initialized("S1");
+        t.set_desired_attached(false);
+        t.set_desired_attached(false); // the overlapping second call
+        t.on_session_lost(Instant::now()); // the first detach landed
+        t.on_detach_failed("S1"); // the second failed
+        assert!(!t.desired_attached(), "the successful detach was undone");
+        assert!(cx_poll(&mut t).is_none(), "nothing re-attaches it");
+        assert!(!t.wants_revival(), "discovery must not revive it either");
+        // A failure for the CURRENT pending detach still rolls back.
+        let mut u = initialized("S1");
+        u.set_desired_attached(false);
+        u.on_detach_failed("S9");
+        assert!(!u.desired_attached(), "a different session's failure");
+        u.on_detach_failed("S1");
+        assert!(u.desired_attached());
     }
 }

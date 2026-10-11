@@ -263,6 +263,16 @@ impl Handler {
                 PendingRequest::ExternalCommand(tx) => {
                     let _ = tx.send(Ok(resp)).ok();
                 }
+                PendingRequest::Detach(target_id, session, tx) => {
+                    let result = match resp.error {
+                        Some(err) => {
+                            self.on_detach_failed(&target_id, &session);
+                            Err(CdpError::Chrome(err))
+                        }
+                        None => Ok(()),
+                    };
+                    let _ = tx.send(result);
+                }
                 PendingRequest::InternalCommand(target_id, session, attempt) => {
                     if let Some(target) = self.targets.get_mut(&target_id) {
                         // A command sent on a session the target no longer has
@@ -651,6 +661,54 @@ impl Handler {
     ///
     /// Remove all commands where `now` > `timestamp of command starting point +
     /// request timeout` and notify the senders that their request timed out.
+    /// Record that `target_id` should stay detached and end its session on the
+    /// browser's own session (screen-play-rs#1041). Answers `tx` when Chrome
+    /// does; a target without a session is answered at once.
+    fn detach_target(&mut self, target_id: TargetId, tx: OneshotSender<Result<()>>, now: Instant) {
+        let Some(target) = self.targets.get_mut(&target_id) else {
+            let _ = tx.send(Ok(()));
+            return;
+        };
+        target.set_desired_attached(false);
+        let Some(session) = target.session_id().cloned() else {
+            let _ = tx.send(Ok(()));
+            return;
+        };
+        let params = crate::cdp::browser_protocol::target::DetachFromTargetParams::builder()
+            .session_id(session.clone())
+            .build();
+        let method = params.identifier();
+        match self
+            .conn
+            .submit_command(method.clone(), None, serde_json::to_value(params).unwrap())
+        {
+            Ok(call_id) => {
+                self.pending_commands.insert(
+                    call_id,
+                    (
+                        PendingRequest::Detach(target_id, session.as_ref().to_string(), tx),
+                        method,
+                        now,
+                    ),
+                );
+            }
+            Err(err) => {
+                self.on_detach_failed(&target_id, session.as_ref());
+                let _ = tx.send(Err(err.into()));
+            }
+        }
+    }
+
+    /// An intentional detach of `session` failed: if that session is still
+    /// the target's and no newer decision replaced this one, the target is
+    /// attached after all (codex R9: an overlapping detach that succeeded
+    /// must not be undone by one that failed because the session was gone).
+    fn on_detach_failed(&mut self, target_id: &TargetId, session: &str) {
+        if let Some(target) = self.targets.get_mut(target_id) {
+            target.on_detach_failed(session);
+        }
+    }
+
     /// Returns whether a target was told its attach timed out: it must be
     /// polled again, which nothing else may trigger on an idle connection.
     fn evict_timed_out_commands(&mut self, now: Instant) -> bool {
@@ -680,6 +738,10 @@ impl Handler {
                         }
                     }
                     PendingRequest::ExternalCommand(tx) => {
+                        let _ = tx.send(Err(CdpError::Timeout));
+                    }
+                    PendingRequest::Detach(target_id, session, tx) => {
+                        self.on_detach_failed(&target_id, &session);
                         let _ = tx.send(Err(CdpError::Timeout));
                     }
                     PendingRequest::InternalCommand(target_id, _, Some(attempt)) => {
@@ -757,12 +819,8 @@ impl Stream for Handler {
                             .map(|page| Page::from(page.clone()));
                         let _ = tx.send(page);
                     }
-                    HandlerMessage::SetDesiredAttachment(target_id, desired, tx) => {
-                        let session = pin.targets.get_mut(&target_id).and_then(|target| {
-                            target.set_desired_attached(desired);
-                            target.session_id().cloned()
-                        });
-                        let _ = tx.send(session);
+                    HandlerMessage::Detach(target_id, tx) => {
+                        pin.detach_target(target_id, tx, now);
                     }
                     HandlerMessage::Reattach(target_id, tx) => {
                         match pin.targets.get_mut(&target_id) {
@@ -973,14 +1031,15 @@ enum PendingRequest {
     /// A common request received via a channel (`Page`).
     ExternalCommand(OneshotSender<Result<Response>>),
     /// Requests that are initiated directly from a `Target` (all the
-    /// initialization commands).
-    /// The target, and the session the command was sent on (`None` for a
-    /// browser-level command such as the attach).
-    /// A target's own command: its target, the session it was sent on, and —
-    /// for a `Target.attachToTarget` — which attach attempt of that target it
+    /// initialization commands): its target, the session it was sent on
+    /// (`None` for a browser-level command such as the attach), and — for a
+    /// `Target.attachToTarget` — which attach attempt of that target it
     /// belongs to, so an abandoned attempt's answer or timeout cannot land on
     /// a newer one (screen-play-rs#1041, codex R4).
     InternalCommand(TargetId, Option<String>, Option<u64>),
+    /// An intentional detach (`Browser::detach_target`): the target, the
+    /// session it ends, and the caller (screen-play-rs#1041, codex R9).
+    Detach(TargetId, String, OneshotSender<Result<()>>),
     // A Request to close the browser.
     CloseBrowser(OneshotSender<Result<CloseReturns>>),
 }
@@ -997,9 +1056,11 @@ pub(crate) enum HandlerMessage {
     GetPages(OneshotSender<Vec<Page>>),
     Command(CommandMessage),
     GetPage(TargetId, OneshotSender<Option<Page>>),
-    /// Record whether a target should stay attached; answers with its current
-    /// session (screen-play-rs#1041).
-    SetDesiredAttachment(TargetId, bool, OneshotSender<Option<SessionId>>),
+    /// Detach a target on purpose: record that it should stay detached and
+    /// end its session, both here — so a caller that stops waiting cannot
+    /// leave the intent recorded without the detach sent (screen-play-rs#1041,
+    /// codex R9).
+    Detach(TargetId, OneshotSender<Result<()>>),
     /// Re-attach a target in place and answer with its page once initialized.
     Reattach(TargetId, OneshotSender<Result<Page>>),
     AddEventListener(EventListenerRequest),
