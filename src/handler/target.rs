@@ -130,6 +130,10 @@ pub struct Target {
     /// between must wait for the replacement session, not get the page of
     /// the session about to go.
     detach_pending: bool,
+    /// An intentional detach abandoned an initialization whose session had
+    /// already arrived; if that detach fails, the session's initialization
+    /// is run again rather than the session declared ready (codex R8).
+    init_abandoned_with_session: bool,
     /// Bumped each time an attach is sent; the handler tags the request with
     /// it, so an answer or timeout of a superseded attempt is ignored.
     attach_attempt: u64,
@@ -187,6 +191,7 @@ impl Target {
             attach_timed_out: false,
             attach_attempt: 0,
             detach_pending: false,
+            init_abandoned_with_session: false,
             page: None,
             init_state: TargetInit::AttachToTarget,
             wait_for_frame_navigation: Default::default(),
@@ -223,8 +228,17 @@ impl Target {
         if desired {
             // The detach did not happen (`Browser::detach_target` failed):
             // the session stays, and a `reattach_target` that waited for its
-            // replacement gets this one.
+            // replacement gets this one — once it is initialized.
             self.detach_pending = false;
+            if std::mem::take(&mut self.init_abandoned_with_session) && self.session_id.is_some() {
+                // Its initialization was abandoned part way: run it again on
+                // the same session; the waiter is answered when it finishes.
+                self.init_state = TargetInit::InitializingFrame(FrameManager::init_commands(
+                    self.config.request_timeout,
+                    self.config.stealth_mode,
+                ));
+                return;
+            }
             if self.session_id.is_some() && self.is_initialized() {
                 if let Some(waiter) = self.reattach_waiter.take() {
                     let page = self.get_or_create_page().map(|p| p.clone().into());
@@ -242,6 +256,7 @@ impl Target {
         let attaching = matches!(self.init_state, TargetInit::AttachToTarget)
             || self.init_state.is_initializing();
         if !desired && attaching {
+            self.init_abandoned_with_session = self.session_id.is_some();
             self.abandon_attachment();
         }
     }
@@ -333,6 +348,7 @@ impl Target {
         // asked for the target back: that re-attach is the caller's, not a
         // rationed recovery.
         let requested = std::mem::take(&mut self.detach_pending) && self.desired_attached;
+        self.init_abandoned_with_session = false;
         self.attach_in_flight = false;
         self.clear_page();
         if matches!(self.init_state, TargetInit::Closing) {
@@ -997,7 +1013,10 @@ impl Target {
                 // A `reattach_target` that arrived while this target was still
                 // attaching (first time or not) is answered by ANY successful
                 // initialization, not only a recovery (codex R1).
-                if self.session_id.is_some() {
+                // Not while an intentional detach is pending: this session is
+                // about to end, and the waiter is answered by its replacement
+                // (codex R8).
+                if self.session_id.is_some() && !self.detach_pending {
                     if let Some(waiter) = self.reattach_waiter.take() {
                         match self.get_or_create_page() {
                             Some(page) => {
@@ -2261,6 +2280,9 @@ mod session_recovery_tests {
         t.set_desired_attached(false);
         let (tx, mut rx) = futures::channel::oneshot::channel();
         t.reattach(Instant::now(), tx);
+        // The handler polls the target before the detach event arrives
+        // (codex R8): that poll must not answer with the doomed session.
+        while cx_poll(&mut t).is_some() {}
         assert!(
             matches!(rx.try_recv(), Ok(None)),
             "not the doomed session's page"
@@ -2302,5 +2324,38 @@ mod session_recovery_tests {
         drive(&mut t, "S2");
         assert!(!t.accepts_event_from("S1"), "the superseded session");
         assert!(t.accepts_event_from("S2"));
+    }
+
+    #[test]
+    fn a_failed_detach_of_an_initializing_session_initializes_it_before_handing_it_out() {
+        // codex R8: detach abandoned the initialization of a session that had
+        // already arrived; the detach failed — the session must be
+        // initialized again, not handed out unfinished.
+        let mut t = target();
+        assert!(matches!(
+            cx_poll(&mut t),
+            Some(TargetEvent::Request(_) | TargetEvent::Attach(..))
+        ));
+        t.set_session_id(SessionId::from("S1".to_string()));
+        assert!(matches!(cx_poll(&mut t), Some(TargetEvent::Request(_)))); // Page.enable
+        t.set_desired_attached(false);
+        let (tx, mut rx) = futures::channel::oneshot::channel();
+        t.reattach(Instant::now(), tx);
+        t.set_desired_attached(true); // the detach failed
+        assert!(
+            matches!(rx.try_recv(), Ok(None)),
+            "not before it is initialized"
+        );
+        let sent = drive(&mut t, "S1");
+        assert!(
+            methods(&sent).contains(&"Page.enable".to_string()),
+            "the initialization runs again: {:?}",
+            methods(&sent)
+        );
+        assert!(sent.iter().all(|r| r.session_id.as_deref() == Some("S1")));
+        match rx.try_recv() {
+            Ok(Some(Ok(page))) => assert_eq!(page.session_id().as_ref(), "S1"),
+            other => panic!("expected the initialized page, got {other:?}"),
+        }
     }
 }
