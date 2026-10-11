@@ -261,6 +261,13 @@ impl Target {
         if attaching {
             self.init_abandoned_with_session = self.session_id.is_some();
             self.abandon_attachment();
+        } else if let Some(initiator) = self.initiator.take() {
+            // Initialized but its first document not loaded yet: `new_page`
+            // still waits, and a detached target will never hand it a page
+            // (codex R12).
+            let _ = initiator.send(Err(CdpError::msg(
+                "the target was detached before its page finished loading",
+            )));
         }
         let decision = self.detach_decision;
         self.session_id.clone().map(|session| (session, decision))
@@ -2493,6 +2500,18 @@ mod session_recovery_tests {
         t.reattach(Instant::now(), tx);
         t.on_response(err_reply(), "Page.enable");
         let _ = cx_poll(&mut t); // fails the initialization
+        assert!(matches!(rx.try_recv(), Ok(Some(Err(_)))));
+    }
+
+    #[test]
+    fn detaching_before_the_first_document_loads_answers_new_page() {
+        // codex R12: initialization done, the first document not loaded yet —
+        // new_page still waits; a detach must answer it.
+        let mut t = initialized("S1");
+        let (tx, mut rx) = futures::channel::oneshot::channel();
+        t.initiator = Some(tx);
+        assert!(t.is_initialized());
+        t.set_desired_attached(false);
         assert!(matches!(rx.try_recv(), Ok(Some(Err(_)))));
     }
 }
