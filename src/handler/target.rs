@@ -122,6 +122,9 @@ pub struct Target {
     /// until the next `poll` turns it into a failed initialization.
     /// `on_response` cannot return the close request itself (screen-play-rs#1035).
     init_error: Option<(String, chromiumoxide_types::Error)>,
+    /// The attach of the current initialization timed out without a session
+    /// (screen-play-rs#1041); the next poll fails the initialization.
+    attach_timed_out: bool,
     /// The handle of the browser page of this target
     page: Option<PageHandle>,
     /// Drives this target towards initialization
@@ -173,6 +176,7 @@ impl Target {
             emulation_manager: EmulationManager::new(request_timeout),
             session_id: None,
             init_error: None,
+            attach_timed_out: false,
             page: None,
             init_state: TargetInit::AttachToTarget,
             wait_for_frame_navigation: Default::default(),
@@ -192,6 +196,8 @@ impl Target {
     pub fn set_session_id(&mut self, id: SessionId) {
         self.session_id = Some(id);
         self.attach_in_flight = false;
+        // A late session means the attach worked after all.
+        self.attach_timed_out = false;
     }
 
     /// Whether this target should have a session (screen-play-rs#1041).
@@ -205,8 +211,12 @@ impl Target {
     pub fn set_desired_attached(&mut self, desired: bool) {
         self.desired_attached = desired;
         // An attach not sent yet is not sent at all (codex R1). One already in
-        // flight is refused by the handler when its session arrives.
-        if !desired && matches!(self.init_state, TargetInit::AttachToTarget) {
+        // flight is abandoned too — its failure must not close the tab as a
+        // failed first initialization (codex R3) — and the handler refuses its
+        // session if it still arrives.
+        let attaching = matches!(self.init_state, TargetInit::AttachToTarget)
+            || (self.session_id.is_none() && self.init_state.commands_mut().is_some());
+        if !desired && attaching {
             self.abandon_attachment();
         }
     }
@@ -217,6 +227,7 @@ impl Target {
         self.attach_in_flight = false;
         self.reattaching = false;
         self.init_error = None;
+        self.attach_timed_out = false;
         let detached =
             || CdpError::msg("the target was detached before its session finished initializing");
         if let Some(initiator) = self.initiator.take() {
@@ -226,6 +237,19 @@ impl Target {
             let _ = waiter.send(Err(detached()));
         }
         self.init_state = TargetInit::Initialized;
+    }
+
+    /// The handler gave up on this target's `Target.attachToTarget`: no
+    /// answer and no session came within the request timeout (codex R3).
+    /// Without this the target would count as attaching forever. Ends the
+    /// attempt like any failed initialization — a recovery retries within the
+    /// budget or gives up and tells whoever waits.
+    pub(crate) fn on_attach_timed_out(&mut self) {
+        if self.session_id.is_some() || !self.attach_in_flight {
+            return;
+        }
+        self.attach_in_flight = false;
+        self.attach_timed_out = self.init_state.commands_mut().is_some();
     }
 
     /// How many re-attaches have completed on this target.
@@ -278,6 +302,7 @@ impl Target {
         self.reattaching = false;
         self.attach_in_flight = false;
         self.init_error = None;
+        self.attach_timed_out = false;
         self.clear_page();
         self.init_state = TargetInit::Initialized;
     }
@@ -334,6 +359,7 @@ impl Target {
         self.session_id = None;
         self.attach_in_flight = false;
         self.init_error = None;
+        self.attach_timed_out = false;
         self.clear_page();
         self.frame_manager.on_session_replaced();
         self.network_manager.on_session_replaced();
@@ -722,6 +748,42 @@ impl Target {
         }))
     }
 
+    /// Hand the network manager's events on: its commands are queued for the
+    /// current session, finished and failed requests go to the frame manager.
+    /// The one drain both the ordinary poll and a re-attach use, so neither
+    /// can drop what the other handles (screen-play-rs#1041, codex R3).
+    ///
+    /// No session, no network commands: they would go to the browser's own
+    /// session. They wait in the manager; a re-attach replaces them with
+    /// `reapply_session_state`.
+    fn drain_network_events(&mut self) {
+        while let Some(event) = self
+            .session_id
+            .is_some()
+            .then(|| self.network_manager.poll())
+            .flatten()
+        {
+            match event {
+                NetworkEvent::SendCdpRequest((method, params)) => {
+                    // send a message to the browser
+                    self.queued_events.push_back(TargetEvent::Request(Request {
+                        method,
+                        session_id: self.session_id.clone().map(Into::into),
+                        params,
+                    }))
+                }
+                NetworkEvent::Request(_) => {}
+                NetworkEvent::Response(_) => {}
+                NetworkEvent::RequestFailed(request) => {
+                    self.frame_manager.on_http_request_finished(request);
+                }
+                NetworkEvent::RequestFinished(request) => {
+                    self.frame_manager.on_http_request_finished(request);
+                }
+            }
+        }
+    }
+
     /// Advance that target's state
     pub(crate) fn poll(&mut self, cx: &mut Context<'_>, now: Instant) -> Option<TargetEvent> {
         if !self.is_page() {
@@ -731,6 +793,10 @@ impl Target {
         if self.init_state.commands_mut().is_some() {
             if let Some((_method, err)) = self.init_error.take() {
                 let ev = self.fail_initialization(CdpError::Chrome(err), now);
+                return self.continue_after_failure(ev, cx, now);
+            }
+            if std::mem::take(&mut self.attach_timed_out) {
+                let ev = self.fail_initialization(CdpError::Timeout, now);
                 return self.continue_after_failure(ev, cx, now);
             }
         }
@@ -838,15 +904,7 @@ impl Target {
                     // woken caller sends: queued events are submitted before
                     // the page's own commands are read (codex R1), so the
                     // first request after a re-attach already has them.
-                    while let Some(event) = self.network_manager.poll() {
-                        if let NetworkEvent::SendCdpRequest((method, params)) = event {
-                            self.queued_events.push_back(TargetEvent::Request(Request {
-                                method,
-                                session_id: self.session_id.clone().map(Into::into),
-                                params,
-                            }));
-                        }
-                    }
+                    self.drain_network_events();
                     let restored = EventSessionRestored {
                         target_id: self.info.target_id.inner().to_string(),
                         generation: self.session_generation,
@@ -999,34 +1057,7 @@ impl Target {
                 }
             }
 
-            // No session, no network commands: they would go to the browser's
-            // own session (screen-play-rs#1041). They wait in the manager;
-            // a re-attach replaces them with `reapply_session_state`.
-            while let Some(event) = self
-                .session_id
-                .is_some()
-                .then(|| self.network_manager.poll())
-                .flatten()
-            {
-                match event {
-                    NetworkEvent::SendCdpRequest((method, params)) => {
-                        // send a message to the browser
-                        self.queued_events.push_back(TargetEvent::Request(Request {
-                            method,
-                            session_id: self.session_id.clone().map(Into::into),
-                            params,
-                        }))
-                    }
-                    NetworkEvent::Request(_) => {}
-                    NetworkEvent::Response(_) => {}
-                    NetworkEvent::RequestFailed(request) => {
-                        self.frame_manager.on_http_request_finished(request);
-                    }
-                    NetworkEvent::RequestFinished(request) => {
-                        self.frame_manager.on_http_request_finished(request);
-                    }
-                }
-            }
+            self.drain_network_events();
 
             while let Some(event) = self.frame_manager.poll(now) {
                 match event {
@@ -1381,6 +1412,7 @@ mod session_recovery_tests {
     //! detached on purpose, within a recovery budget.
     use super::*;
     use crate::listeners::{EventListenerRequest, EventStream};
+    use chromiumoxide_cdp::cdp::browser_protocol::page::FrameTree;
     use futures::StreamExt;
     use std::task::Context;
 
@@ -1818,5 +1850,97 @@ mod session_recovery_tests {
         t.reattach(Instant::now(), tx);
         assert!(matches!(rx.try_recv(), Ok(Some(Err(_)))));
         assert!(t.reattach_waiter.is_none());
+    }
+
+    #[test]
+    fn detaching_during_the_first_attach_never_closes_the_tab() {
+        // codex R3: the first attach is in flight (no session yet) when the
+        // caller detaches; if that attach then fails, the tab must not be
+        // closed as a failed first initialization — the caller only detached.
+        let mut t = target();
+        let (tx, mut rx) = futures::channel::oneshot::channel();
+        t.initiator = Some(tx);
+        assert!(matches!(cx_poll(&mut t), Some(TargetEvent::Request(_)))); // attach
+        t.set_desired_attached(false);
+        assert!(
+            matches!(rx.try_recv(), Ok(Some(Err(_)))),
+            "new_page hears at once"
+        );
+        t.on_response(err_reply(), AttachToTargetParams::IDENTIFIER);
+        match cx_poll(&mut t) {
+            None => {}
+            other => panic!("nothing may be sent — above all no closeTarget: {other:?}"),
+        }
+        assert!(!matches!(t.init_state, TargetInit::Closing));
+    }
+
+    #[test]
+    fn a_timed_out_recovery_attach_is_retried_not_left_in_flight() {
+        // codex R3: the handler evicts a timed-out `Target.attachToTarget`
+        // without an answer; the target must not stay "attaching" forever.
+        let mut t = initialized("S1");
+        t.on_session_lost(Instant::now());
+        match cx_poll(&mut t) {
+            Some(TargetEvent::Request(req)) => {
+                assert_eq!(req.method, AttachToTargetParams::IDENTIFIER)
+            }
+            other => panic!("expected the recovery attach, got {other:?}"),
+        }
+        t.on_attach_timed_out();
+        match cx_poll(&mut t) {
+            Some(TargetEvent::Request(req)) => {
+                assert_eq!(req.method, AttachToTargetParams::IDENTIFIER, "{req:?}")
+            }
+            other => panic!("expected a retry attach, got {other:?}"),
+        }
+        // And once the budget is spent, a waiting reattach_target hears.
+        let (tx, mut rx) = futures::channel::oneshot::channel();
+        t.reattach(Instant::now(), tx);
+        for _ in 0..RECOVERY_BUDGET {
+            t.on_attach_timed_out();
+            while cx_poll(&mut t).is_some() {}
+        }
+        assert!(
+            matches!(rx.try_recv(), Ok(Some(Err(_)))),
+            "reattach_target must hear"
+        );
+    }
+
+    #[test]
+    fn a_request_finished_while_re_attaching_still_reaches_its_frame() {
+        // codex R3: the re-attach drains the network manager to queue the
+        // restored settings; a completion event in that queue must still be
+        // handed to the frame manager, as the ordinary drain does.
+        let mut t = initialized("S1");
+        let tree: FrameTree = serde_json::from_value(serde_json::json!({
+            "frame": {
+                "id": "F1", "loaderId": "L1", "url": "about:blank",
+                "domainAndRegistry": "", "securityOrigin": "null",
+                "mimeType": "text/html", "secureContextType": "InsecureScheme",
+                "crossOriginIsolatedContextType": "NotIsolated",
+                "gatedAPIFeatures": []
+            }
+        }))
+        .unwrap();
+        t.frame_manager.on_frame_tree(tree);
+        t.on_session_lost(Instant::now());
+        assert!(matches!(cx_poll(&mut t), Some(TargetEvent::Request(_)))); // attach
+        t.set_session_id(SessionId::from("S2".to_string()));
+        let request = crate::handler::http::HttpRequest::new(
+            "R1".to_string().into(),
+            Some("F1".to_string().into()),
+            None,
+            false,
+            Vec::new(),
+        );
+        t.network_manager
+            .queue_event_for_test(NetworkEvent::RequestFinished(request));
+        drive(&mut t, "S2");
+        assert_eq!(t.session_generation(), 1);
+        let frame = t.frame_manager.main_frame().expect("main frame");
+        assert!(
+            frame.http_request().is_some(),
+            "the finished request was dropped by the re-attach drain"
+        );
     }
 }

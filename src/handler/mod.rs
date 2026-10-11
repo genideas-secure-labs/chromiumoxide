@@ -649,7 +649,7 @@ impl Handler {
             .map(|(k, _)| *k)
             .collect::<Vec<_>>();
         for call in timed_out {
-            if let Some((req, _, _)) = self.pending_commands.remove(&call) {
+            if let Some((req, method, _)) = self.pending_commands.remove(&call) {
                 match req {
                     PendingRequest::CreateTarget(tx) => {
                         let _ = tx.send(Err(CdpError::Timeout));
@@ -669,7 +669,18 @@ impl Handler {
                     PendingRequest::ExternalCommand(tx) => {
                         let _ = tx.send(Err(CdpError::Timeout));
                     }
-                    PendingRequest::InternalCommand(..) => {}
+                    PendingRequest::InternalCommand(target_id, _) => {
+                        // An attach that never answered leaves no session to
+                        // time out on; tell the target, or it counts as
+                        // attaching forever (screen-play-rs#1041, codex R3).
+                        if method.as_ref()
+                            == crate::cdp::browser_protocol::target::AttachToTargetParams::IDENTIFIER
+                        {
+                            if let Some(target) = self.targets.get_mut(&target_id) {
+                                target.on_attach_timed_out();
+                            }
+                        }
+                    }
                     PendingRequest::CloseBrowser(tx) => {
                         let _ = tx.send(Err(CdpError::Timeout));
                     }

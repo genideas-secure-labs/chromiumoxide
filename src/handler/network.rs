@@ -81,6 +81,11 @@ impl NetworkManager {
     /// (screen-play-rs#1041). The user's settings — extra headers, cache,
     /// credentials, interception, offline — are kept; `reapply_session_state`
     /// sends them to the new session.
+    #[cfg(test)]
+    pub(crate) fn queue_event_for_test(&mut self, event: NetworkEvent) {
+        self.queued_events.push_back(event);
+    }
+
     pub fn on_session_replaced(&mut self) {
         self.queued_events.clear();
         self.requests.clear();
