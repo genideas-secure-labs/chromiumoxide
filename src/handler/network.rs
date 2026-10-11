@@ -103,7 +103,9 @@ impl NetworkManager {
         if intercept {
             // Also re-sends the cache setting, as enabling interception does.
             self.update_protocol_request_interception();
-        } else if self.user_cache_disabled {
+        } else {
+            // Always, as `Target::new` does for the first session: the new
+            // session starts from Chrome's defaults, not from what was set.
             self.update_protocol_cache_disabled();
         }
         if self.offline {
