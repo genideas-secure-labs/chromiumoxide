@@ -219,9 +219,8 @@ impl Target {
         self.attach_in_flight = false;
         self.reattaching = false;
         self.init_error = None;
-        let detached = || {
-            CdpError::msg("the target was detached before its session finished initializing")
-        };
+        let detached =
+            || CdpError::msg("the target was detached before its session finished initializing");
         if let Some(initiator) = self.initiator.take() {
             let _ = initiator.send(Err(detached()));
         }
@@ -654,7 +653,9 @@ impl Target {
             // target (codex R1). On the browser session, by session id.
             let failed_session = self.session_id.take();
             let detach_failed = failed_session.map(|session| {
-                let params = DetachFromTargetParams::builder().session_id(session).build();
+                let params = DetachFromTargetParams::builder()
+                    .session_id(session)
+                    .build();
                 TargetEvent::Request(Request {
                     method: params.identifier(),
                     session_id: None,
@@ -973,7 +974,15 @@ impl Target {
                 }
             }
 
-            while let Some(event) = self.network_manager.poll() {
+            // No session, no network commands: they would go to the browser's
+            // own session (screen-play-rs#1041). They wait in the manager;
+            // a re-attach replaces them with `reapply_session_state`.
+            while let Some(event) = self
+                .session_id
+                .is_some()
+                .then(|| self.network_manager.poll())
+                .flatten()
+            {
                 match event {
                     NetworkEvent::SendCdpRequest((method, params)) => {
                         // send a message to the browser
@@ -1495,6 +1504,94 @@ mod session_recovery_tests {
         assert!(cx_poll(&mut t).is_none());
     }
 
+    fn err_reply() -> Response {
+        Response {
+            id: chromiumoxide_types::CallId::new(1),
+            result: None,
+            error: Some(chromiumoxide_types::Error {
+                code: -32001,
+                message: "Session with given id not found.".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_new_page_whose_recovery_gives_up_gets_an_error_not_a_hang() {
+        // codex R1 P1: first initialization loses its session, recovery
+        // retries until the budget is spent — the `new_page` caller hears.
+        let mut t = target();
+        let (tx, mut rx) = futures::channel::oneshot::channel();
+        t.initiator = Some(tx);
+        assert!(matches!(cx_poll(&mut t), Some(TargetEvent::Request(_))));
+        t.set_session_id(SessionId::from("S1".to_string()));
+        t.on_session_lost(Instant::now());
+        for i in 0..20 {
+            // Answer each retry's attach with a session, then fail it.
+            let mut attached = false;
+            while let Some(ev) = cx_poll(&mut t) {
+                if let TargetEvent::Request(req) = ev {
+                    if req.method == AttachToTargetParams::IDENTIFIER {
+                        attached = true;
+                        break;
+                    }
+                }
+            }
+            if !attached {
+                break;
+            }
+            t.set_session_id(SessionId::from(format!("R{i}")));
+            t.on_response(err_reply(), "Page.enable");
+        }
+        while cx_poll(&mut t).is_some() {}
+        match rx.try_recv() {
+            Ok(Some(Err(_))) => {}
+            other => panic!("the new_page caller must get an error, got {other:?}"),
+        }
+        assert!(t.session_id().is_none());
+    }
+
+    #[test]
+    fn an_intentional_detach_before_the_attach_is_sent_cancels_it() {
+        let mut t = target();
+        let (tx, mut rx) = futures::channel::oneshot::channel();
+        t.initiator = Some(tx);
+        t.set_desired_attached(false);
+        assert!(cx_poll(&mut t).is_none(), "no attach may be sent");
+        assert!(matches!(rx.try_recv(), Ok(Some(Err(_)))));
+    }
+
+    #[test]
+    fn reattach_during_the_first_initialization_answers_when_it_completes() {
+        let mut t = target();
+        assert!(matches!(cx_poll(&mut t), Some(TargetEvent::Request(_)))); // attach
+        let (tx, mut rx) = futures::channel::oneshot::channel();
+        t.reattach(Instant::now(), tx);
+        t.set_session_id(SessionId::from("S1".to_string()));
+        drive(&mut t, "S1");
+        assert!(t.is_initialized());
+        match rx.try_recv() {
+            Ok(Some(Ok(page))) => assert_eq!(page.session_id().as_ref(), "S1"),
+            other => panic!("reattach_target must get the page, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_recovery_ends_its_session() {
+        let mut t = initialized("S1");
+        t.on_session_lost(Instant::now());
+        assert!(matches!(cx_poll(&mut t), Some(TargetEvent::Request(_)))); // attach
+        t.set_session_id(SessionId::from("S2".to_string()));
+        t.on_response(err_reply(), "Page.enable");
+        match cx_poll(&mut t) {
+            Some(TargetEvent::Request(req)) => {
+                assert_eq!(req.method, "Target.detachFromTarget", "{req:?}");
+                assert!(req.session_id.is_none(), "on the browser session: {req:?}");
+                assert_eq!(req.params["sessionId"], "S2");
+            }
+            other => panic!("the failed session must be ended, got {other:?}"),
+        }
+    }
+
     #[test]
     fn the_recovery_budget_stops_an_attach_loop() {
         let mut t = initialized("S1");
@@ -1572,7 +1669,14 @@ mod session_recovery_tests {
             },
             "Page.enable",
         );
-        // Not closed: it tries again (an attach), within the budget.
+        // Not closed: the failed session is ended, then it tries again (an
+        // attach), within the budget.
+        match cx_poll(&mut t) {
+            Some(TargetEvent::Request(req)) => {
+                assert_eq!(req.method, "Target.detachFromTarget", "{req:?}")
+            }
+            other => panic!("expected the failed session to be ended, got {other:?}"),
+        }
         match cx_poll(&mut t) {
             Some(TargetEvent::Request(req)) => {
                 assert_eq!(req.method, AttachToTargetParams::IDENTIFIER, "{req:?}")

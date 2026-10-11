@@ -314,7 +314,11 @@ impl Handler {
         )?;
         self.pending_commands.insert(
             call_id,
-            (PendingRequest::InternalCommand(target_id, session), req.method, now),
+            (
+                PendingRequest::InternalCommand(target_id, session),
+                req.method,
+                now,
+            ),
         );
         Ok(())
     }
