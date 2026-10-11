@@ -272,6 +272,7 @@ impl Target {
     }
 
     /// Which attach attempt is current (see `attach_attempt`).
+    #[cfg(test)]
     pub(crate) fn attach_attempt(&self) -> u64 {
         self.attach_attempt
     }
@@ -850,10 +851,10 @@ impl Target {
                 self.attach_in_flight = true;
                 self.attach_attempt += 1;
 
-                return Some(TargetEvent::Request(Request::new(
-                    params.identifier(),
-                    serde_json::to_value(params).unwrap(),
-                )));
+                return Some(TargetEvent::Attach(
+                    Request::new(params.identifier(), serde_json::to_value(params).unwrap()),
+                    self.attach_attempt,
+                ));
             }
             TargetInit::InitializingFrame(cmds) => {
                 self.session_id.as_ref()?;
@@ -1235,6 +1236,12 @@ impl TargetType {
 pub(crate) enum TargetEvent {
     /// An internal request
     Request(Request),
+    /// A `Target.attachToTarget`, with the attach attempt it starts: the
+    /// handler tags the request with it, so a superseded attempt's answer or
+    /// timeout is ignored (screen-play-rs#1041, codex R4). Its own variant —
+    /// the target is out of the handler's map while it is polled, so the
+    /// handler cannot look the attempt up (codex R5).
+    Attach(Request, u64),
     /// An internal navigation request
     NavigationRequest(NavigationId, Request),
     /// Indicates that a previous requested navigation has finished
@@ -1397,7 +1404,10 @@ mod init_error_tests {
         let (tx, mut rx) = futures::channel::oneshot::channel();
         t.initiator = Some(tx);
         // Attach is sent; the chain starts.
-        assert!(matches!(poll(&mut t), Some(TargetEvent::Request(_))));
+        assert!(matches!(
+            poll(&mut t),
+            Some(TargetEvent::Request(_) | TargetEvent::Attach(..))
+        ));
         assert!(t.init_state.commands_mut().is_some());
 
         t.on_response(
@@ -1425,7 +1435,10 @@ mod init_error_tests {
     #[test]
     fn a_vanished_frame_refusing_its_isolated_world_is_not_a_failure() {
         let mut t = page_target();
-        assert!(matches!(poll(&mut t), Some(TargetEvent::Request(_))));
+        assert!(matches!(
+            poll(&mut t),
+            Some(TargetEvent::Request(_) | TargetEvent::Attach(..))
+        ));
         t.on_response(
             reply(Some((-32000, "No frame for given id found"))),
             CreateIsolatedWorldParams::IDENTIFIER,
@@ -1437,7 +1450,10 @@ mod init_error_tests {
     #[test]
     fn a_success_answer_still_advances_the_chain() {
         let mut t = page_target();
-        assert!(matches!(poll(&mut t), Some(TargetEvent::Request(_))));
+        assert!(matches!(
+            poll(&mut t),
+            Some(TargetEvent::Request(_) | TargetEvent::Attach(..))
+        ));
         t.on_response(reply(None), "Target.attachToTarget");
         assert!(t.init_error.is_none());
         assert!(!matches!(t.init_state, TargetInit::Closing));
@@ -1488,7 +1504,7 @@ mod session_recovery_tests {
         let mut sent = Vec::new();
         for _ in 0..500 {
             match cx_poll(t) {
-                Some(TargetEvent::Request(req)) => {
+                Some(TargetEvent::Request(req) | TargetEvent::Attach(req, _)) => {
                     let method = req.method.to_string();
                     sent.push(req);
                     if method == AttachToTargetParams::IDENTIFIER {
@@ -1627,14 +1643,17 @@ mod session_recovery_tests {
         let mut t = target();
         let (tx, mut rx) = futures::channel::oneshot::channel();
         t.initiator = Some(tx);
-        assert!(matches!(cx_poll(&mut t), Some(TargetEvent::Request(_))));
+        assert!(matches!(
+            cx_poll(&mut t),
+            Some(TargetEvent::Request(_) | TargetEvent::Attach(..))
+        ));
         t.set_session_id(SessionId::from("S1".to_string()));
         t.on_session_lost(Instant::now());
         for i in 0..20 {
             // Answer each retry's attach with a session, then fail it.
             let mut attached = false;
             while let Some(ev) = cx_poll(&mut t) {
-                if let TargetEvent::Request(req) = ev {
+                if let TargetEvent::Request(req) | TargetEvent::Attach(req, _) = ev {
                     if req.method == AttachToTargetParams::IDENTIFIER {
                         attached = true;
                         break;
@@ -1668,7 +1687,10 @@ mod session_recovery_tests {
     #[test]
     fn reattach_during_the_first_initialization_answers_when_it_completes() {
         let mut t = target();
-        assert!(matches!(cx_poll(&mut t), Some(TargetEvent::Request(_)))); // attach
+        assert!(matches!(
+            cx_poll(&mut t),
+            Some(TargetEvent::Request(_) | TargetEvent::Attach(..))
+        )); // attach
         let (tx, mut rx) = futures::channel::oneshot::channel();
         t.reattach(Instant::now(), tx);
         t.set_session_id(SessionId::from("S1".to_string()));
@@ -1684,11 +1706,14 @@ mod session_recovery_tests {
     fn a_failed_recovery_ends_its_session() {
         let mut t = initialized("S1");
         t.on_session_lost(Instant::now());
-        assert!(matches!(cx_poll(&mut t), Some(TargetEvent::Request(_)))); // attach
+        assert!(matches!(
+            cx_poll(&mut t),
+            Some(TargetEvent::Request(_) | TargetEvent::Attach(..))
+        )); // attach
         t.set_session_id(SessionId::from("S2".to_string()));
         t.on_response(err_reply(), "Page.enable");
         match cx_poll(&mut t) {
-            Some(TargetEvent::Request(req)) => {
+            Some(TargetEvent::Request(req) | TargetEvent::Attach(req, _)) => {
                 assert_eq!(req.method, "Target.detachFromTarget", "{req:?}");
                 assert!(req.session_id.is_none(), "on the browser session: {req:?}");
                 assert_eq!(req.params["sessionId"], "S2");
@@ -1717,10 +1742,13 @@ mod session_recovery_tests {
     fn a_session_lost_mid_initialization_is_recovered_and_sends_nothing_meanwhile() {
         let mut t = target();
         // Attach, get the session, answer a few init commands.
-        assert!(matches!(cx_poll(&mut t), Some(TargetEvent::Request(_))));
+        assert!(matches!(
+            cx_poll(&mut t),
+            Some(TargetEvent::Request(_) | TargetEvent::Attach(..))
+        ));
         t.set_session_id(SessionId::from("S1".to_string()));
         for _ in 0..3 {
-            if let Some(TargetEvent::Request(req)) = cx_poll(&mut t) {
+            if let Some(TargetEvent::Request(req) | TargetEvent::Attach(req, _)) = cx_poll(&mut t) {
                 let m = req.method.to_string();
                 t.on_response(
                     Response {
@@ -1761,7 +1789,10 @@ mod session_recovery_tests {
     fn a_failed_re_attach_does_not_close_the_tab() {
         let mut t = initialized("S1");
         t.on_session_lost(Instant::now());
-        assert!(matches!(cx_poll(&mut t), Some(TargetEvent::Request(_)))); // attach
+        assert!(matches!(
+            cx_poll(&mut t),
+            Some(TargetEvent::Request(_) | TargetEvent::Attach(..))
+        )); // attach
         t.set_session_id(SessionId::from("S2".to_string()));
         t.on_response(
             Response {
@@ -1777,13 +1808,13 @@ mod session_recovery_tests {
         // Not closed: the failed session is ended, then it tries again (an
         // attach), within the budget.
         match cx_poll(&mut t) {
-            Some(TargetEvent::Request(req)) => {
+            Some(TargetEvent::Request(req) | TargetEvent::Attach(req, _)) => {
                 assert_eq!(req.method, "Target.detachFromTarget", "{req:?}")
             }
             other => panic!("expected the failed session to be ended, got {other:?}"),
         }
         match cx_poll(&mut t) {
-            Some(TargetEvent::Request(req)) => {
+            Some(TargetEvent::Request(req) | TargetEvent::Attach(req, _)) => {
                 assert_eq!(req.method, AttachToTargetParams::IDENTIFIER, "{req:?}")
             }
             other => panic!("expected a retry attach, got {other:?}"),
@@ -1821,7 +1852,7 @@ mod session_recovery_tests {
         let mut waiter = None;
         for i in 0..(RECOVERY_BUDGET + 3) {
             match cx_poll(&mut t) {
-                Some(TargetEvent::Request(req))
+                Some(TargetEvent::Request(req) | TargetEvent::Attach(req, _))
                     if req.method == AttachToTargetParams::IDENTIFIER =>
                 {
                     attaches += 1;
@@ -1854,15 +1885,20 @@ mod session_recovery_tests {
         // found") — that answer belongs to the cleanup, not the retry.
         let mut t = initialized("S1");
         t.on_session_lost(Instant::now());
-        assert!(matches!(cx_poll(&mut t), Some(TargetEvent::Request(_)))); // attach
+        assert!(matches!(
+            cx_poll(&mut t),
+            Some(TargetEvent::Request(_) | TargetEvent::Attach(..))
+        )); // attach
         t.set_session_id(SessionId::from("S2".to_string()));
         t.on_response(err_reply(), "Page.enable");
         match cx_poll(&mut t) {
-            Some(TargetEvent::Request(req)) => assert_eq!(req.method, "Target.detachFromTarget"),
+            Some(TargetEvent::Request(req) | TargetEvent::Attach(req, _)) => {
+                assert_eq!(req.method, "Target.detachFromTarget")
+            }
             other => panic!("expected the cleanup detach, got {other:?}"),
         }
         match cx_poll(&mut t) {
-            Some(TargetEvent::Request(req)) => {
+            Some(TargetEvent::Request(req) | TargetEvent::Attach(req, _)) => {
                 assert_eq!(req.method, AttachToTargetParams::IDENTIFIER)
             }
             other => panic!("expected the retry attach, got {other:?}"),
@@ -1908,7 +1944,10 @@ mod session_recovery_tests {
         let mut t = target();
         let (tx, mut rx) = futures::channel::oneshot::channel();
         t.initiator = Some(tx);
-        assert!(matches!(cx_poll(&mut t), Some(TargetEvent::Request(_)))); // attach
+        assert!(matches!(
+            cx_poll(&mut t),
+            Some(TargetEvent::Request(_) | TargetEvent::Attach(..))
+        )); // attach
         t.set_desired_attached(false);
         assert!(
             matches!(rx.try_recv(), Ok(Some(Err(_)))),
@@ -1929,7 +1968,7 @@ mod session_recovery_tests {
         let mut t = initialized("S1");
         t.on_session_lost(Instant::now());
         match cx_poll(&mut t) {
-            Some(TargetEvent::Request(req)) => {
+            Some(TargetEvent::Request(req) | TargetEvent::Attach(req, _)) => {
                 assert_eq!(req.method, AttachToTargetParams::IDENTIFIER)
             }
             other => panic!("expected the recovery attach, got {other:?}"),
@@ -1939,7 +1978,7 @@ mod session_recovery_tests {
             t.on_attach_timed_out(a);
         }
         match cx_poll(&mut t) {
-            Some(TargetEvent::Request(req)) => {
+            Some(TargetEvent::Request(req) | TargetEvent::Attach(req, _)) => {
                 assert_eq!(req.method, AttachToTargetParams::IDENTIFIER, "{req:?}")
             }
             other => panic!("expected a retry attach, got {other:?}"),
@@ -1978,7 +2017,10 @@ mod session_recovery_tests {
         .unwrap();
         t.frame_manager.on_frame_tree(tree);
         t.on_session_lost(Instant::now());
-        assert!(matches!(cx_poll(&mut t), Some(TargetEvent::Request(_)))); // attach
+        assert!(matches!(
+            cx_poll(&mut t),
+            Some(TargetEvent::Request(_) | TargetEvent::Attach(..))
+        )); // attach
         t.set_session_id(SessionId::from("S2".to_string()));
         let request = crate::handler::http::HttpRequest::new(
             "R1".to_string().into(),
@@ -2004,12 +2046,18 @@ mod session_recovery_tests {
         // reattach_target: the first attach's late error or timeout belongs
         // to the abandoned attempt, not the new one.
         let mut t = target();
-        assert!(matches!(cx_poll(&mut t), Some(TargetEvent::Request(_)))); // attempt 1
+        assert!(matches!(
+            cx_poll(&mut t),
+            Some(TargetEvent::Request(_) | TargetEvent::Attach(..))
+        )); // attempt 1
         let first = t.attach_attempt();
         t.set_desired_attached(false);
         let (tx, _rx) = futures::channel::oneshot::channel();
         t.reattach(Instant::now(), tx);
-        assert!(matches!(cx_poll(&mut t), Some(TargetEvent::Request(_)))); // attempt 2
+        assert!(matches!(
+            cx_poll(&mut t),
+            Some(TargetEvent::Request(_) | TargetEvent::Attach(..))
+        )); // attempt 2
         let second = t.attach_attempt();
         assert_ne!(first, second);
         assert!(
@@ -2038,7 +2086,7 @@ mod session_recovery_tests {
         t.on_session_lost(Instant::now());
         assert!(t.expects_session(), "re-attaching");
         for _ in 0..(RECOVERY_BUDGET + 2) {
-            if let Some(TargetEvent::Request(req)) = cx_poll(&mut t) {
+            if let Some(TargetEvent::Request(req) | TargetEvent::Attach(req, _)) = cx_poll(&mut t) {
                 if req.method == AttachToTargetParams::IDENTIFIER {
                     let a = t.attach_attempt();
                     t.on_attach_timed_out(a);
@@ -2055,5 +2103,25 @@ mod session_recovery_tests {
         .unwrap();
         let w = Target::new(info, TargetConfig::default(), BrowserContext::default());
         assert!(w.expects_session());
+    }
+
+    #[test]
+    fn every_attach_names_its_attempt_for_the_handler() {
+        // codex R5: the handler polls a target while it is out of the
+        // handler's map, so it cannot look the attempt up — the attach event
+        // has to carry it.
+        let mut t = initialized("S1");
+        for expected in 2..=3 {
+            t.on_session_lost(Instant::now());
+            match cx_poll(&mut t) {
+                Some(TargetEvent::Attach(req, attempt)) => {
+                    assert_eq!(req.method, AttachToTargetParams::IDENTIFIER);
+                    assert_eq!(attempt, expected);
+                    assert_eq!(attempt, t.attach_attempt());
+                }
+                other => panic!("expected an attach carrying its attempt, got {other:?}"),
+            }
+            drive(&mut t, "S1");
+        }
     }
 }

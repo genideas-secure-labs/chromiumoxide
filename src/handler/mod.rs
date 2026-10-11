@@ -298,17 +298,15 @@ impl Handler {
         Ok(())
     }
 
+    /// `attempt`: the attach attempt, for a target's `Target.attachToTarget`.
     pub(crate) fn submit_internal_command(
         &mut self,
         target_id: TargetId,
         req: CdpRequest,
+        attempt: Option<u64>,
         now: Instant,
     ) -> Result<()> {
         let session = req.session_id.clone();
-        let attempt = (req.method.as_ref()
-            == crate::cdp::browser_protocol::target::AttachToTargetParams::IDENTIFIER)
-            .then(|| self.targets.get(&target_id).map(|t| t.attach_attempt()))
-            .flatten();
         let call_id = self.conn.submit_command(
             req.method.clone(),
             req.session_id.map(Into::into),
@@ -589,6 +587,7 @@ impl Handler {
                     session_id: None,
                     params: serde_json::to_value(params).unwrap(),
                 },
+                None,
                 Instant::now(),
             );
         }
@@ -784,6 +783,15 @@ impl Stream for Handler {
                                 let _ = pin.submit_internal_command(
                                     target.target_id().clone(),
                                     req,
+                                    None,
+                                    now,
+                                );
+                            }
+                            TargetEvent::Attach(req, attempt) => {
+                                let _ = pin.submit_internal_command(
+                                    target.target_id().clone(),
+                                    req,
+                                    Some(attempt),
                                     now,
                                 );
                             }
