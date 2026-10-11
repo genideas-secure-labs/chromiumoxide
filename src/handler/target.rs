@@ -328,14 +328,13 @@ impl Target {
         self.desired_attached = true;
         self.detach_pending = false;
         if std::mem::take(&mut self.init_abandoned_with_session) {
-            // Its initialization was abandoned part way: run it again on the
-            // same session — including the utility world, whose name an
-            // abandoned chain may already have claimed (codex R10).
-            self.frame_manager.forget_isolated_worlds();
-            self.init_state = TargetInit::InitializingFrame(FrameManager::init_commands(
-                self.config.request_timeout,
-                self.config.stealth_mode,
-            ));
+            // Its initialization was abandoned part way. Not run again on the
+            // same session — the abandoned chain's late answers would be
+            // indistinguishable from the new chain's (codex R11) — but on a
+            // fresh one, as the caller's re-attach: the old session's answers
+            // and events are then filtered by session, the utility world is
+            // created again, and a recovery stays a recovery.
+            self.begin_reattach(Instant::now(), true);
             return true;
         }
         if self.is_initialized() {
@@ -864,6 +863,11 @@ impl Target {
             // forever (codex R1).
             self.give_up_recovery(error);
             return detach_failed;
+        }
+        // A `reattach_target` that joined this first initialization hears the
+        // error too, not only `new_page` (codex R11).
+        if let Some(waiter) = self.reattach_waiter.take() {
+            let _ = waiter.send(Err(CdpError::msg(error.to_string())));
         }
         if let Some(initiator) = self.initiator.take() {
             let _ = initiator.send(Err(error));
@@ -2371,9 +2375,9 @@ mod session_recovery_tests {
 
     #[test]
     fn a_failed_detach_of_an_initializing_session_initializes_it_before_handing_it_out() {
-        // codex R8: detach abandoned the initialization of a session that had
-        // already arrived; the detach failed — the session must be
-        // initialized again, not handed out unfinished.
+        // codex R8/R11: detach abandoned the initialization of a session that
+        // had already arrived; the detach failed — the target is initialized
+        // again, on a fresh session, before a waiting reattach gets it.
         let mut t = target();
         assert!(matches!(
             cx_poll(&mut t),
@@ -2386,21 +2390,25 @@ mod session_recovery_tests {
         t.reattach(Instant::now(), tx);
         {
             let d = t.detach_decision;
-            t.on_detach_failed("S1", d);
+            assert!(t.on_detach_failed("S1", d), "the restart needs a poll");
         } // the detach failed
         assert!(
             matches!(rx.try_recv(), Ok(None)),
             "not before it is initialized"
         );
-        let sent = drive(&mut t, "S1");
+        // The abandoned chain's late answer on S1 is not the new chain's.
+        assert!(!t.answers_current(Some("S1"), None));
+        let sent = drive(&mut t, "S2");
+        let names = methods(&sent);
+        assert_eq!(names[0], AttachToTargetParams::IDENTIFIER, "{names:?}");
+        assert!(names.contains(&"Page.enable".to_string()), "{names:?}");
         assert!(
-            methods(&sent).contains(&"Page.enable".to_string()),
-            "the initialization runs again: {:?}",
-            methods(&sent)
+            sent[1..]
+                .iter()
+                .all(|r| r.session_id.as_deref() == Some("S2"))
         );
-        assert!(sent.iter().all(|r| r.session_id.as_deref() == Some("S1")));
         match rx.try_recv() {
-            Ok(Some(Ok(page))) => assert_eq!(page.session_id().as_ref(), "S1"),
+            Ok(Some(Ok(page))) => assert_eq!(page.session_id().as_ref(), "S2"),
             other => panic!("expected the initialized page, got {other:?}"),
         }
     }
@@ -2468,5 +2476,23 @@ mod session_recovery_tests {
             !t.frame_manager
                 .has_isolated_world_for_test(UTILITY_WORLD_NAME)
         );
+    }
+
+    #[test]
+    fn a_reattach_joined_to_a_failed_first_initialization_hears_the_error() {
+        // codex R11: reattach_target arrived during the first initialization;
+        // that initialization fails — the waiter hears, it is not left to the
+        // close (which may itself fail).
+        let mut t = target();
+        assert!(matches!(
+            cx_poll(&mut t),
+            Some(TargetEvent::Request(_) | TargetEvent::Attach(..))
+        ));
+        t.set_session_id(SessionId::from("S1".to_string()));
+        let (tx, mut rx) = futures::channel::oneshot::channel();
+        t.reattach(Instant::now(), tx);
+        t.on_response(err_reply(), "Page.enable");
+        let _ = cx_poll(&mut t); // fails the initialization
+        assert!(matches!(rx.try_recv(), Ok(Some(Err(_)))));
     }
 }
