@@ -80,6 +80,10 @@ pub struct Target {
     emulation_manager: EmulationManager,
     /// The identifier of the session this target is attached to
     session_id: Option<SessionId>,
+    /// A required initialization command Chrome answered with an error, held
+    /// until the next `poll` turns it into a failed initialization.
+    /// `on_response` cannot return the close request itself (screen-play-rs#1035).
+    init_error: Option<(String, chromiumoxide_types::Error)>,
     /// The handle of the browser page of this target
     page: Option<PageHandle>,
     /// Drives this target towards initialization
@@ -113,6 +117,7 @@ impl Target {
             network_manager,
             emulation_manager: EmulationManager::new(request_timeout),
             session_id: None,
+            init_error: None,
             page: None,
             init_state: TargetInit::AttachToTarget,
             wait_for_frame_navigation: Default::default(),
@@ -272,6 +277,27 @@ impl Target {
     /// Received a response to a command issued by this target
     pub fn on_response(&mut self, resp: Response, method: &str) {
         if let Some(cmds) = self.init_state.commands_mut() {
+            // An error answer to an initialization command used to advance the
+            // chain like a success, so a target whose `Page.enable` was refused
+            // still called itself Initialized — and then never saw a page event
+            // (screen-play-rs#1035). Fail the initialization instead: the next
+            // `poll` reports Chrome's error to whoever waits and closes the
+            // target, as a timed-out command already did. Measured before
+            // tightening: 1,722 initialization responses over launch, connect,
+            // two concurrent clients, OOPIF/worker pages and tabs closed
+            // mid-initialization — none was an error.
+            if let Some(err) = &resp.error {
+                tracing::warn!(
+                    target_id = ?self.info.target_id,
+                    method,
+                    code = err.code,
+                    message = %err.message,
+                    "initialization command failed"
+                );
+                if self.init_error.is_none() {
+                    self.init_error = Some((method.to_string(), err.clone()));
+                }
+            }
             cmds.received_response(method);
         }
         #[allow(clippy::single_match)] // allow for now
@@ -371,8 +397,14 @@ impl Target {
 
     /// Called when a init command timed out
     fn on_initialization_failed(&mut self) -> TargetEvent {
+        self.fail_initialization(CdpError::Timeout)
+    }
+
+    /// End a failed initialization: report `error` to whoever waits for the
+    /// page, and close the target.
+    fn fail_initialization(&mut self, error: CdpError) -> TargetEvent {
         if let Some(initiator) = self.initiator.take() {
-            let _ = initiator.send(Err(CdpError::Timeout));
+            let _ = initiator.send(Err(error));
         }
         self.init_state = TargetInit::Closing;
         let close_target = CloseTargetParams::new(self.info.target_id.clone());
@@ -388,6 +420,11 @@ impl Target {
         if !self.is_page() {
             // can only poll pages
             return None;
+        }
+        if self.init_state.commands_mut().is_some() {
+            if let Some((_method, err)) = self.init_error.take() {
+                return Some(self.fail_initialization(CdpError::Chrome(err)));
+            }
         }
         match &mut self.init_state {
             TargetInit::AttachToTarget => {
@@ -868,4 +905,83 @@ pub enum TargetMessage {
     /// Get the `ExecutionContext` if available
     GetExecutionContext(GetExecutionContext),
     Authenticate(Credentials),
+}
+
+#[cfg(test)]
+mod init_error_tests {
+    //! screen-play-rs#1035: an error answer to an initialization command fails
+    //! the initialization instead of being counted as a completed step.
+    use super::*;
+    use std::task::Context;
+
+    fn page_target() -> Target {
+        let info: TargetInfo = serde_json::from_value(serde_json::json!({
+            "targetId": "T1", "type": "page", "title": "", "url": "about:blank",
+            "attached": false, "canAccessOpener": false
+        }))
+        .unwrap();
+        let mut t = Target::new(info, TargetConfig::default(), BrowserContext::default());
+        t.set_session_id(SessionId::from("S1".to_string()));
+        t
+    }
+
+    fn reply(error: Option<(i64, &str)>) -> Response {
+        Response {
+            id: chromiumoxide_types::CallId::new(1),
+            result: error.is_none().then(|| serde_json::json!({})),
+            error: error.map(|(code, message)| chromiumoxide_types::Error {
+                code,
+                message: message.to_string(),
+            }),
+        }
+    }
+
+    fn poll(t: &mut Target) -> Option<TargetEvent> {
+        let waker = futures::task::noop_waker();
+        t.poll(&mut Context::from_waker(&waker), Instant::now())
+    }
+
+    #[test]
+    fn an_error_answer_fails_initialization_and_closes_the_target() {
+        let mut t = page_target();
+        let (tx, mut rx) = futures::channel::oneshot::channel();
+        t.initiator = Some(tx);
+        // Attach is sent; the chain starts.
+        assert!(matches!(poll(&mut t), Some(TargetEvent::Request(_))));
+        assert!(t.init_state.commands_mut().is_some());
+
+        t.on_response(
+            reply(Some((-32001, "Session with given id not found."))),
+            "Page.enable",
+        );
+        match poll(&mut t) {
+            Some(TargetEvent::Request(req)) => assert_eq!(req.method, "Target.closeTarget"),
+            other => panic!("expected the target to be closed, got {other:?}"),
+        }
+        assert!(matches!(t.init_state, TargetInit::Closing));
+        match rx.try_recv() {
+            Ok(Some(Err(CdpError::Chrome(e)))) => {
+                assert_eq!(e.message, "Session with given id not found.")
+            }
+            other => panic!("the waiter should get Chrome's error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_success_answer_still_advances_the_chain() {
+        let mut t = page_target();
+        assert!(matches!(poll(&mut t), Some(TargetEvent::Request(_))));
+        t.on_response(reply(None), "Target.attachToTarget");
+        assert!(t.init_error.is_none());
+        assert!(!matches!(t.init_state, TargetInit::Closing));
+    }
+
+    #[test]
+    fn an_error_after_initialization_is_not_an_initialization_failure() {
+        let mut t = page_target();
+        t.init_state = TargetInit::Initialized;
+        t.on_response(reply(Some((-32000, "boom"))), "Runtime.evaluate");
+        assert!(t.init_error.is_none());
+        assert!(matches!(t.init_state, TargetInit::Initialized));
+    }
 }

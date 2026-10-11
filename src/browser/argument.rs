@@ -5,8 +5,11 @@ use std::fmt;
 /// scalar. For these, a default and a user value should be *unioned* (both
 /// contribute); every other switch is scalar, where a user value *replaces* the
 /// default. Used by [`ArgsBuilder::arg_defaults`].
-const MERGEABLE_LIST_SWITCHES: [&str; 3] =
-    ["enable-features", "disable-features", "enable-blink-features"];
+const MERGEABLE_LIST_SWITCHES: [&str; 3] = [
+    "enable-features",
+    "disable-features",
+    "enable-blink-features",
+];
 
 pub struct ArgsBuilder(HashMap<String, Vec<String>>);
 
@@ -184,7 +187,10 @@ mod tests {
         let mut b = ArgsBuilder::new();
         b.arg(Arg::value("disable-features", "TranslateUI"))
             .arg(Arg::value("disable-features", "HttpsUpgrades"));
-        assert_eq!(rendered(b), vec!["--disable-features=TranslateUI,HttpsUpgrades"]);
+        assert_eq!(
+            rendered(b),
+            vec!["--disable-features=TranslateUI,HttpsUpgrades"]
+        );
     }
 
     #[test]
@@ -219,7 +225,10 @@ mod tests {
         let rendered = rendered(b);
         assert_eq!(rendered.len(), 1);
         assert!(rendered[0].starts_with("--disable-features="));
-        assert!(rendered[0].contains("MyFeature"), "user flag kept: {rendered:?}");
+        assert!(
+            rendered[0].contains("MyFeature"),
+            "user flag kept: {rendered:?}"
+        );
         assert!(
             rendered[0].contains("TranslateUI"),
             "default flag kept: {rendered:?}"
