@@ -263,15 +263,13 @@ impl Handler {
                 PendingRequest::ExternalCommand(tx) => {
                     let _ = tx.send(Ok(resp)).ok();
                 }
-                PendingRequest::InternalCommand(target_id, session) => {
+                PendingRequest::InternalCommand(target_id, session, attempt) => {
                     if let Some(target) = self.targets.get_mut(&target_id) {
                         // A command sent on a session the target no longer has
                         // answers for that old session, not the current
-                        // initialization (screen-play-rs#1041, codex R1).
-                        let stale = session
-                            .as_deref()
-                            .is_some_and(|s| target.session_id().map(|c| c.as_ref()) != Some(s));
-                        if !stale {
+                        // initialization (screen-play-rs#1041, codex R1); an
+                        // attach answers for its own attempt (codex R4).
+                        if target.answers_current(session.as_deref(), attempt) {
                             target.on_response(resp, method.as_ref());
                         }
                     }
@@ -307,6 +305,10 @@ impl Handler {
         now: Instant,
     ) -> Result<()> {
         let session = req.session_id.clone();
+        let attempt = (req.method.as_ref()
+            == crate::cdp::browser_protocol::target::AttachToTargetParams::IDENTIFIER)
+            .then(|| self.targets.get(&target_id).map(|t| t.attach_attempt()))
+            .flatten();
         let call_id = self.conn.submit_command(
             req.method.clone(),
             req.session_id.map(Into::into),
@@ -315,7 +317,7 @@ impl Handler {
         self.pending_commands.insert(
             call_id,
             (
-                PendingRequest::InternalCommand(target_id, session),
+                PendingRequest::InternalCommand(target_id, session, attempt),
                 req.method,
                 now,
             ),
@@ -560,13 +562,18 @@ impl Handler {
         let session = Session::new(event.session_id.clone(), event.target_info.target_id);
         let mut refuse = false;
         if let Some(target) = self.targets.get_mut(session.target_id()) {
-            if target.desired_attached() {
-                target.set_session_id(session.session_id().clone())
-            } else {
+            if !target.desired_attached() {
                 // Detached on purpose while this attach was in flight
                 // (screen-play-rs#1041, codex R1): end the session it brought
                 // instead of adopting it.
                 target.abandon_attachment();
+                refuse = true;
+            } else if target.expects_session() {
+                target.set_session_id(session.session_id().clone())
+            } else {
+                // A session nothing is waiting for — a timed-out attach that
+                // answered after recovery gave up: adopting it would expose a
+                // page whose session never ran its initialization (codex R4).
                 refuse = true;
             }
         }
@@ -641,7 +648,10 @@ impl Handler {
     ///
     /// Remove all commands where `now` > `timestamp of command starting point +
     /// request timeout` and notify the senders that their request timed out.
-    fn evict_timed_out_commands(&mut self, now: Instant) {
+    /// Returns whether a target was told its attach timed out: it must be
+    /// polled again, which nothing else may trigger on an idle connection.
+    fn evict_timed_out_commands(&mut self, now: Instant) -> bool {
+        let mut marked = false;
         let timed_out = self
             .pending_commands
             .iter()
@@ -649,7 +659,7 @@ impl Handler {
             .map(|(k, _)| *k)
             .collect::<Vec<_>>();
         for call in timed_out {
-            if let Some((req, method, _)) = self.pending_commands.remove(&call) {
+            if let Some((req, _, _)) = self.pending_commands.remove(&call) {
                 match req {
                     PendingRequest::CreateTarget(tx) => {
                         let _ = tx.send(Err(CdpError::Timeout));
@@ -669,24 +679,25 @@ impl Handler {
                     PendingRequest::ExternalCommand(tx) => {
                         let _ = tx.send(Err(CdpError::Timeout));
                     }
-                    PendingRequest::InternalCommand(target_id, _) => {
+                    PendingRequest::InternalCommand(target_id, _, Some(attempt)) => {
                         // An attach that never answered leaves no session to
                         // time out on; tell the target, or it counts as
-                        // attaching forever (screen-play-rs#1041, codex R3).
-                        if method.as_ref()
-                            == crate::cdp::browser_protocol::target::AttachToTargetParams::IDENTIFIER
-                        {
-                            if let Some(target) = self.targets.get_mut(&target_id) {
-                                target.on_attach_timed_out();
+                        // attaching forever (screen-play-rs#1041, codex R3) —
+                        // unless a newer attempt replaced it (codex R4).
+                        if let Some(target) = self.targets.get_mut(&target_id) {
+                            if target.on_attach_timed_out(attempt) {
+                                marked = true;
                             }
                         }
                     }
+                    PendingRequest::InternalCommand(..) => {}
                     PendingRequest::CloseBrowser(tx) => {
                         let _ = tx.send(Err(CdpError::Timeout));
                     }
                 }
             }
         }
+        marked
     }
 
     pub fn event_listeners_mut(&mut self) -> &mut EventListeners {
@@ -837,8 +848,12 @@ impl Stream for Handler {
             }
 
             if pin.evict_command_timeout.poll_ready(cx) {
-                // evict all commands that timed out
-                pin.evict_timed_out_commands(now);
+                // evict all commands that timed out; a target told its attach
+                // timed out is polled again now, not at the next unrelated
+                // wakeup (screen-play-rs#1041, codex R4)
+                if pin.evict_timed_out_commands(now) {
+                    done = false;
+                }
             }
 
             if done {
@@ -949,7 +964,11 @@ enum PendingRequest {
     /// initialization commands).
     /// The target, and the session the command was sent on (`None` for a
     /// browser-level command such as the attach).
-    InternalCommand(TargetId, Option<String>),
+    /// A target's own command: its target, the session it was sent on, and —
+    /// for a `Target.attachToTarget` — which attach attempt of that target it
+    /// belongs to, so an abandoned attempt's answer or timeout cannot land on
+    /// a newer one (screen-play-rs#1041, codex R4).
+    InternalCommand(TargetId, Option<String>, Option<u64>),
     // A Request to close the browser.
     CloseBrowser(OneshotSender<Result<CloseReturns>>),
 }

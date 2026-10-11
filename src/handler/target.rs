@@ -125,6 +125,9 @@ pub struct Target {
     /// The attach of the current initialization timed out without a session
     /// (screen-play-rs#1041); the next poll fails the initialization.
     attach_timed_out: bool,
+    /// Bumped each time an attach is sent; the handler tags the request with
+    /// it, so an answer or timeout of a superseded attempt is ignored.
+    attach_attempt: u64,
     /// The handle of the browser page of this target
     page: Option<PageHandle>,
     /// Drives this target towards initialization
@@ -177,6 +180,7 @@ impl Target {
             session_id: None,
             init_error: None,
             attach_timed_out: false,
+            attach_attempt: 0,
             page: None,
             init_state: TargetInit::AttachToTarget,
             wait_for_frame_navigation: Default::default(),
@@ -244,12 +248,44 @@ impl Target {
     /// Without this the target would count as attaching forever. Ends the
     /// attempt like any failed initialization — a recovery retries within the
     /// budget or gives up and tells whoever waits.
-    pub(crate) fn on_attach_timed_out(&mut self) {
-        if self.session_id.is_some() || !self.attach_in_flight {
-            return;
+    /// `attempt` is the timed-out attach's (see `attach_attempt`); a
+    /// superseded attempt's timeout is ignored (codex R4). Returns whether
+    /// the target now needs a poll to act on it.
+    pub(crate) fn on_attach_timed_out(&mut self, attempt: u64) -> bool {
+        if attempt != self.attach_attempt || self.session_id.is_some() || !self.attach_in_flight {
+            return false;
         }
         self.attach_in_flight = false;
         self.attach_timed_out = self.init_state.commands_mut().is_some();
+        self.attach_timed_out
+    }
+
+    /// Whether a response to this target's own command belongs to its current
+    /// state: one sent on a session it no longer has answers for that old
+    /// session (codex R1), and an attach answers for its own attempt — not a
+    /// newer one that replaced it (codex R4).
+    pub(crate) fn answers_current(&self, session: Option<&str>, attempt: Option<u64>) -> bool {
+        let old_session =
+            session.is_some_and(|s| self.session_id.as_ref().map(|c| c.as_ref()) != Some(s));
+        let old_attempt = attempt.is_some_and(|a| a != self.attach_attempt);
+        !old_session && !old_attempt
+    }
+
+    /// Which attach attempt is current (see `attach_attempt`).
+    pub(crate) fn attach_attempt(&self) -> u64 {
+        self.attach_attempt
+    }
+
+    /// Whether an arriving session is the one this target is attaching for.
+    /// A page that is not attaching — it gave up, or already has a session —
+    /// does not adopt one (codex R4). Other target types keep the old
+    /// behaviour: they are never polled, so they never attach themselves.
+    pub(crate) fn expects_session(&self) -> bool {
+        !self.is_page()
+            || (self.session_id.is_none()
+                && (self.attach_in_flight
+                    || matches!(self.init_state, TargetInit::AttachToTarget)
+                    || self.init_state.is_initializing()))
     }
 
     /// How many re-attaches have completed on this target.
@@ -812,6 +848,7 @@ impl Target {
                     .build()
                     .unwrap();
                 self.attach_in_flight = true;
+                self.attach_attempt += 1;
 
                 return Some(TargetEvent::Request(Request::new(
                     params.identifier(),
@@ -1232,6 +1269,17 @@ impl TargetInit {
             TargetInit::Initialized => None,
             TargetInit::Closing => None,
         }
+    }
+
+    /// Running a command chain — what `commands_mut` answers, read-only.
+    fn is_initializing(&self) -> bool {
+        matches!(
+            self,
+            TargetInit::InitializingFrame(_)
+                | TargetInit::InitializingNetwork(_)
+                | TargetInit::InitializingPage(_)
+                | TargetInit::InitializingEmulation(_)
+        )
     }
 }
 
@@ -1886,7 +1934,10 @@ mod session_recovery_tests {
             }
             other => panic!("expected the recovery attach, got {other:?}"),
         }
-        t.on_attach_timed_out();
+        {
+            let a = t.attach_attempt();
+            t.on_attach_timed_out(a);
+        }
         match cx_poll(&mut t) {
             Some(TargetEvent::Request(req)) => {
                 assert_eq!(req.method, AttachToTargetParams::IDENTIFIER, "{req:?}")
@@ -1897,7 +1948,10 @@ mod session_recovery_tests {
         let (tx, mut rx) = futures::channel::oneshot::channel();
         t.reattach(Instant::now(), tx);
         for _ in 0..RECOVERY_BUDGET {
-            t.on_attach_timed_out();
+            {
+                let a = t.attach_attempt();
+                t.on_attach_timed_out(a);
+            }
             while cx_poll(&mut t).is_some() {}
         }
         assert!(
@@ -1942,5 +1996,64 @@ mod session_recovery_tests {
             frame.http_request().is_some(),
             "the finished request was dropped by the re-attach drain"
         );
+    }
+
+    #[test]
+    fn an_abandoned_attempts_answer_and_timeout_do_not_reach_the_next_attempt() {
+        // codex R4: detach while the first attach is in flight, then
+        // reattach_target: the first attach's late error or timeout belongs
+        // to the abandoned attempt, not the new one.
+        let mut t = target();
+        assert!(matches!(cx_poll(&mut t), Some(TargetEvent::Request(_)))); // attempt 1
+        let first = t.attach_attempt();
+        t.set_desired_attached(false);
+        let (tx, _rx) = futures::channel::oneshot::channel();
+        t.reattach(Instant::now(), tx);
+        assert!(matches!(cx_poll(&mut t), Some(TargetEvent::Request(_)))); // attempt 2
+        let second = t.attach_attempt();
+        assert_ne!(first, second);
+        assert!(
+            !t.answers_current(None, Some(first)),
+            "the old attempt's answer"
+        );
+        assert!(t.answers_current(None, Some(second)));
+        assert!(!t.on_attach_timed_out(first), "the old attempt's timeout");
+        assert!(cx_poll(&mut t).is_none(), "the new attempt is untouched");
+        assert!(
+            t.on_attach_timed_out(second),
+            "its own timeout needs a poll"
+        );
+        // Session-bound answers: an old session's answer is not current.
+        t.set_session_id(SessionId::from("S9".to_string()));
+        assert!(!t.answers_current(Some("S1"), None));
+        assert!(t.answers_current(Some("S9"), None));
+    }
+
+    #[test]
+    fn a_page_that_gave_up_adopts_no_late_session() {
+        // codex R4: an attach that answers after recovery gave up would hand
+        // out a page whose session never ran its initialization.
+        let mut t = initialized("S1");
+        assert!(!t.expects_session(), "attached already");
+        t.on_session_lost(Instant::now());
+        assert!(t.expects_session(), "re-attaching");
+        for _ in 0..(RECOVERY_BUDGET + 2) {
+            if let Some(TargetEvent::Request(req)) = cx_poll(&mut t) {
+                if req.method == AttachToTargetParams::IDENTIFIER {
+                    let a = t.attach_attempt();
+                    t.on_attach_timed_out(a);
+                }
+            }
+        }
+        assert!(t.session_id().is_none());
+        assert!(!t.expects_session(), "gave up: a late session is refused");
+        // Non-page targets keep accepting (they never attach themselves).
+        let info: TargetInfo = serde_json::from_value(serde_json::json!({
+            "targetId": "W1", "type": "service_worker", "title": "", "url": "https://a/sw.js",
+            "attached": false, "canAccessOpener": false
+        }))
+        .unwrap();
+        let w = Target::new(info, TargetConfig::default(), BrowserContext::default());
+        assert!(w.expects_session());
     }
 }
