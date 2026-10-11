@@ -217,6 +217,22 @@ impl FrameManager {
     /// initialization chain does, once `isolated_worlds` no longer claims them.
     /// Frames themselves stay: the page did not navigate, and the chain's
     /// `Page.getFrameTree` refreshes them.
+    /// Forget which isolated worlds exist, so an initialization chain run
+    /// again creates them again (screen-play-rs#1041, codex R10).
+    pub fn forget_isolated_worlds(&mut self) {
+        self.isolated_worlds.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn claim_isolated_world_for_test(&mut self, name: &str) {
+        self.isolated_worlds.insert(name.to_string());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_isolated_world_for_test(&self, name: &str) -> bool {
+        self.isolated_worlds.contains(name)
+    }
+
     pub fn on_session_replaced(&mut self) {
         for frame in self.frames.values_mut() {
             frame.clear_contexts();

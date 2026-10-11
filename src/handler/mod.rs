@@ -263,10 +263,10 @@ impl Handler {
                 PendingRequest::ExternalCommand(tx) => {
                     let _ = tx.send(Ok(resp)).ok();
                 }
-                PendingRequest::Detach(target_id, session, tx) => {
+                PendingRequest::Detach(target_id, session, decision, tx) => {
                     let result = match resp.error {
                         Some(err) => {
-                            self.on_detach_failed(&target_id, &session);
+                            self.on_detach_failed(&target_id, &session, decision);
                             Err(CdpError::Chrome(err))
                         }
                         None => Ok(()),
@@ -669,8 +669,7 @@ impl Handler {
             let _ = tx.send(Ok(()));
             return;
         };
-        target.set_desired_attached(false);
-        let Some(session) = target.session_id().cloned() else {
+        let Some((session, decision)) = target.begin_detach() else {
             let _ = tx.send(Ok(()));
             return;
         };
@@ -686,14 +685,19 @@ impl Handler {
                 self.pending_commands.insert(
                     call_id,
                     (
-                        PendingRequest::Detach(target_id, session.as_ref().to_string(), tx),
+                        PendingRequest::Detach(
+                            target_id,
+                            session.as_ref().to_string(),
+                            decision,
+                            tx,
+                        ),
                         method,
                         now,
                     ),
                 );
             }
             Err(err) => {
-                self.on_detach_failed(&target_id, session.as_ref());
+                self.on_detach_failed(&target_id, session.as_ref(), decision);
                 let _ = tx.send(Err(err.into()));
             }
         }
@@ -703,10 +707,11 @@ impl Handler {
     /// the target's and no newer decision replaced this one, the target is
     /// attached after all (codex R9: an overlapping detach that succeeded
     /// must not be undone by one that failed because the session was gone).
-    fn on_detach_failed(&mut self, target_id: &TargetId, session: &str) {
-        if let Some(target) = self.targets.get_mut(target_id) {
-            target.on_detach_failed(session);
-        }
+    /// Returns whether the target must be polled again.
+    fn on_detach_failed(&mut self, target_id: &TargetId, session: &str, decision: u64) -> bool {
+        self.targets
+            .get_mut(target_id)
+            .is_some_and(|target| target.on_detach_failed(session, decision))
     }
 
     /// Returns whether a target was told its attach timed out: it must be
@@ -740,8 +745,12 @@ impl Handler {
                     PendingRequest::ExternalCommand(tx) => {
                         let _ = tx.send(Err(CdpError::Timeout));
                     }
-                    PendingRequest::Detach(target_id, session, tx) => {
-                        self.on_detach_failed(&target_id, &session);
+                    PendingRequest::Detach(target_id, session, decision, tx) => {
+                        // A restarted initialization needs a poll, which an
+                        // idle connection would not bring (codex R10).
+                        if self.on_detach_failed(&target_id, &session, decision) {
+                            marked = true;
+                        }
                         let _ = tx.send(Err(CdpError::Timeout));
                     }
                     PendingRequest::InternalCommand(target_id, _, Some(attempt)) => {
@@ -1039,7 +1048,7 @@ enum PendingRequest {
     InternalCommand(TargetId, Option<String>, Option<u64>),
     /// An intentional detach (`Browser::detach_target`): the target, the
     /// session it ends, and the caller (screen-play-rs#1041, codex R9).
-    Detach(TargetId, String, OneshotSender<Result<()>>),
+    Detach(TargetId, String, u64, OneshotSender<Result<()>>),
     // A Request to close the browser.
     CloseBrowser(OneshotSender<Result<CloseReturns>>),
 }
