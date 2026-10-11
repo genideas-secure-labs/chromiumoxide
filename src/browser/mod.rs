@@ -50,6 +50,24 @@ pub struct Browser {
     browser_context: BrowserContext,
 }
 
+/// See [`Browser::page_lookup`].
+#[derive(Debug, Clone)]
+pub struct PageLookup {
+    sender: Sender<HandlerMessage>,
+}
+
+impl PageLookup {
+    /// The page of `target_id` on its current session.
+    pub async fn get_page(&self, target_id: TargetId) -> Result<Page> {
+        let (tx, rx) = oneshot_channel();
+        self.sender
+            .clone()
+            .send(HandlerMessage::GetPage(target_id, tx))
+            .await?;
+        rx.await?.ok_or(CdpError::NotFound)
+    }
+}
+
 /// Browser connection information.
 #[derive(serde::Deserialize, Debug, Default)]
 pub struct BrowserConnection {
@@ -464,6 +482,15 @@ impl Browser {
             .send(HandlerMessage::Reattach(target_id, tx))
             .await?;
         rx.await?
+    }
+
+    /// A cloneable handle that looks pages up — for a task that outlives a
+    /// borrow of this `Browser`, e.g. one re-fetching a tab's page after
+    /// [`crate::handler::target::EventSessionRestored`] (screen-play-rs#1041).
+    pub fn page_lookup(&self) -> PageLookup {
+        PageLookup {
+            sender: self.sender.clone(),
+        }
     }
 
     /// Return page of given target_id
