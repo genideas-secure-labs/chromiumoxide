@@ -215,11 +215,12 @@ impl Target {
     pub fn set_desired_attached(&mut self, desired: bool) {
         self.desired_attached = desired;
         // An attach not sent yet is not sent at all (codex R1). One already in
-        // flight is abandoned too — its failure must not close the tab as a
-        // failed first initialization (codex R3) — and the handler refuses its
-        // session if it still arrives.
+        // flight, or a session still initializing, is abandoned too: its
+        // failure must not close the tab as a failed first initialization
+        // (codex R3, R6) — the detach that follows ends the session, and the
+        // handler refuses a session that arrives after this.
         let attaching = matches!(self.init_state, TargetInit::AttachToTarget)
-            || (self.session_id.is_none() && self.init_state.commands_mut().is_some());
+            || self.init_state.is_initializing();
         if !desired && attaching {
             self.abandon_attachment();
         }
@@ -1103,7 +1104,13 @@ impl Target {
                         self.queued_events
                             .push_back(TargetEvent::NavigationResult(res));
                     }
-                    FrameEvent::NavigationRequest(id, req) => {
+                    FrameEvent::NavigationRequest(id, mut req) => {
+                        // A navigation queued before a re-attach names the
+                        // session it was asked on; it goes to the session the
+                        // target has now (screen-play-rs#1041, codex R6).
+                        if let Some(session) = &self.session_id {
+                            req.session_id = Some(session.as_ref().to_string());
+                        }
                         self.queued_events
                             .push_back(TargetEvent::NavigationRequest(id, req));
                     }
@@ -2123,5 +2130,87 @@ mod session_recovery_tests {
             }
             drive(&mut t, "S1");
         }
+    }
+
+    #[test]
+    fn detaching_after_the_first_session_arrived_never_closes_the_tab() {
+        // codex R6: the session is there and initialization is running when
+        // the caller detaches; an initialization error arriving before the
+        // detach lands must not close the tab.
+        let mut t = target();
+        let (tx, mut rx) = futures::channel::oneshot::channel();
+        t.initiator = Some(tx);
+        assert!(matches!(
+            cx_poll(&mut t),
+            Some(TargetEvent::Request(_) | TargetEvent::Attach(..))
+        ));
+        t.set_session_id(SessionId::from("S1".to_string()));
+        assert!(matches!(cx_poll(&mut t), Some(TargetEvent::Request(_)))); // Page.enable
+        t.set_desired_attached(false);
+        assert!(
+            matches!(rx.try_recv(), Ok(Some(Err(_)))),
+            "new_page hears at once"
+        );
+        t.on_response(err_reply(), "Page.enable");
+        while let Some(ev) = cx_poll(&mut t) {
+            if let TargetEvent::Request(req) = &ev {
+                assert_ne!(req.method, "Target.closeTarget", "the tab was closed");
+            }
+        }
+        assert!(!matches!(t.init_state, TargetInit::Closing));
+    }
+
+    #[test]
+    fn a_navigation_queued_across_a_re_attach_goes_to_the_new_session() {
+        // codex R6: a `goto` asked while the session was being replaced names
+        // the lost session; it must be sent on the new one.
+        let mut t = initialized("S1");
+        let tree: FrameTree = serde_json::from_value(serde_json::json!({
+            "frame": {
+                "id": "F1", "loaderId": "L1", "url": "about:blank",
+                "domainAndRegistry": "", "securityOrigin": "null",
+                "mimeType": "text/html", "secureContextType": "InsecureScheme",
+                "crossOriginIsolatedContextType": "NotIsolated",
+                "gatedAPIFeatures": []
+            }
+        }))
+        .unwrap();
+        t.frame_manager.on_frame_tree(tree);
+        t.on_session_lost(Instant::now());
+        t.frame_manager.goto(FrameNavigationRequest::new(
+            NavigationId(7),
+            Request {
+                method: "Page.navigate".into(),
+                session_id: Some("S1".into()),
+                params: serde_json::json!({ "url": "about:blank#x" }),
+            },
+        ));
+        let mut navigated_on = None;
+        for _ in 0..500 {
+            match cx_poll(&mut t) {
+                Some(TargetEvent::Request(req) | TargetEvent::Attach(req, _)) => {
+                    let method = req.method.to_string();
+                    if method == AttachToTargetParams::IDENTIFIER {
+                        t.set_session_id(SessionId::from("S2".to_string()));
+                    }
+                    t.on_response(
+                        Response {
+                            id: chromiumoxide_types::CallId::new(1),
+                            result: Some(serde_json::json!({})),
+                            error: None,
+                        },
+                        &method,
+                    );
+                }
+                Some(TargetEvent::NavigationRequest(id, req)) => {
+                    assert_eq!(id, NavigationId(7));
+                    navigated_on = req.session_id.clone();
+                    break;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert_eq!(navigated_on.as_deref(), Some("S2"));
     }
 }
