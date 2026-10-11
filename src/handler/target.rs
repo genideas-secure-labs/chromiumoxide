@@ -1213,13 +1213,7 @@ impl Target {
                         self.queued_events
                             .push_back(TargetEvent::NavigationResult(res));
                     }
-                    FrameEvent::NavigationRequest(id, mut req) => {
-                        // A navigation queued before a re-attach names the
-                        // session it was asked on; it goes to the session the
-                        // target has now (screen-play-rs#1041, codex R6).
-                        if let Some(session) = &self.session_id {
-                            req.session_id = Some(session.as_ref().to_string());
-                        }
+                    FrameEvent::NavigationRequest(id, req) => {
                         self.queued_events
                             .push_back(TargetEvent::NavigationRequest(id, req));
                     }
@@ -2270,9 +2264,10 @@ mod session_recovery_tests {
     }
 
     #[test]
-    fn a_navigation_queued_across_a_re_attach_goes_to_the_new_session() {
-        // codex R6: a `goto` asked while the session was being replaced names
-        // the lost session; it must be sent on the new one.
+    fn a_navigation_queued_across_a_re_attach_fails_instead_of_racing_the_restore() {
+        // codex R6, then the final review: a `goto` asked of the lost session
+        // must not be sent on the new one before the caller's state is back;
+        // it ends with an error the caller can retry.
         let mut t = initialized("S1");
         let tree: FrameTree = serde_json::from_value(serde_json::json!({
             "frame": {
@@ -2285,7 +2280,6 @@ mod session_recovery_tests {
         }))
         .unwrap();
         t.frame_manager.on_frame_tree(tree);
-        t.on_session_lost(Instant::now());
         t.frame_manager.goto(FrameNavigationRequest::new(
             NavigationId(7),
             Request {
@@ -2294,7 +2288,9 @@ mod session_recovery_tests {
                 params: serde_json::json!({ "url": "about:blank#x" }),
             },
         ));
-        let mut navigated_on = None;
+        t.on_session_lost(Instant::now());
+        let mut sent_navigation = false;
+        let mut failed = false;
         for _ in 0..500 {
             match cx_poll(&mut t) {
                 Some(TargetEvent::Request(req) | TargetEvent::Attach(req, _)) => {
@@ -2311,16 +2307,19 @@ mod session_recovery_tests {
                         &method,
                     );
                 }
-                Some(TargetEvent::NavigationRequest(id, req)) => {
+                Some(TargetEvent::NavigationRequest(..)) => sent_navigation = true,
+                Some(TargetEvent::NavigationResult(Err(NavigationError::SessionReplaced {
+                    id,
+                }))) => {
                     assert_eq!(id, NavigationId(7));
-                    navigated_on = req.session_id.clone();
-                    break;
+                    failed = true;
                 }
                 Some(_) => {}
                 None => break,
             }
         }
-        assert_eq!(navigated_on.as_deref(), Some("S2"));
+        assert!(failed, "the queued navigation must end with an error");
+        assert!(!sent_navigation, "it must not be sent on the new session");
     }
 
     #[test]

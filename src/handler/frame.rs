@@ -194,6 +194,8 @@ pub struct FrameManager {
     request_timeout: Duration,
     /// Track currently in progress navigation
     pending_navigations: VecDeque<(FrameNavigationRequest, NavigationWatcher)>,
+    /// Navigations ended by a session replacement, reported by `poll`.
+    failed_navigations: VecDeque<NavigationId>,
     /// The currently ongoing navigation
     navigation: Option<(NavigationWatcher, Instant)>,
 }
@@ -207,6 +209,7 @@ impl FrameManager {
             isolated_worlds: Default::default(),
             request_timeout,
             pending_navigations: Default::default(),
+            failed_navigations: Default::default(),
             navigation: None,
         }
     }
@@ -228,6 +231,15 @@ impl FrameManager {
     }
 
     pub fn on_session_replaced(&mut self) {
+        // Navigations asked of the old session end with an error instead of
+        // being sent on the new one: they would load a document before the
+        // caller's state (UA, init scripts) is back on it (codex final).
+        if let Some((watcher, _)) = self.navigation.take() {
+            self.failed_navigations.push_back(watcher.id);
+        }
+        for (req, _) in self.pending_navigations.drain(..) {
+            self.failed_navigations.push_back(req.id);
+        }
         for frame in self.frames.values_mut() {
             frame.clear_contexts();
         }
@@ -328,6 +340,11 @@ impl FrameManager {
     }
 
     pub fn poll(&mut self, now: Instant) -> Option<FrameEvent> {
+        if let Some(id) = self.failed_navigations.pop_front() {
+            return Some(FrameEvent::NavigationResult(Err(
+                NavigationError::SessionReplaced { id },
+            )));
+        }
         // check if the navigation completed
         if let Some((watcher, deadline)) = self.navigation.take() {
             if now > deadline {
@@ -608,6 +625,12 @@ pub enum NavigationError {
         id: NavigationId,
         frame: FrameId,
     },
+    /// The target's session was replaced before this navigation finished
+    /// (screen-play-rs#1041): it was asked of a session that is gone, and
+    /// whoever restores the page's state on the new one has not yet — retry.
+    SessionReplaced {
+        id: NavigationId,
+    },
 }
 
 impl NavigationError {
@@ -615,6 +638,7 @@ impl NavigationError {
         match self {
             NavigationError::Timeout { id, .. } => id,
             NavigationError::FrameNotFound { id, .. } => id,
+            NavigationError::SessionReplaced { id } => id,
         }
     }
 }
