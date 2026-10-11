@@ -740,6 +740,15 @@ impl Stream for Handler {
                             TargetEvent::NavigationResult(res) => {
                                 pin.on_navigation_lifecycle_completed(res)
                             }
+                            TargetEvent::SessionRestored(ev) => {
+                                // Also to `Browser::event_listener` subscribers,
+                                // so one listener per browser sees every tab's
+                                // restoration (screen-play-rs#1041).
+                                let _ = pin.event_listeners.try_send_custom(
+                                    "Chromiumoxide.sessionRestored",
+                                    serde_json::to_value(&ev).unwrap(),
+                                );
+                            }
                         }
                     }
 

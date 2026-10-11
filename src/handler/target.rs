@@ -754,6 +754,8 @@ impl Target {
                         "Chromiumoxide.sessionRestored",
                         serde_json::to_value(&restored).unwrap(),
                     );
+                    self.queued_events
+                        .push_back(TargetEvent::SessionRestored(restored));
                     if let Some(waiter) = self.reattach_waiter.take() {
                         match self.get_or_create_page() {
                             Some(page) => {
@@ -1057,6 +1059,9 @@ pub(crate) enum TargetEvent {
     NavigationResult(Result<NavigationOk, NavigationError>),
     /// A new command arrived via a channel
     Command(CommandMessage),
+    /// The target finished re-attaching on a new session; the handler also
+    /// tells the browser-level listeners (screen-play-rs#1041).
+    SessionRestored(EventSessionRestored),
 }
 
 // TODO this can be moved into the classes?
