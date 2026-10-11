@@ -9,7 +9,9 @@ use futures::stream::Stream;
 use futures::task::{Context, Poll};
 
 use chromiumoxide_cdp::cdp::CdpEventMessage;
-use chromiumoxide_cdp::cdp::browser_protocol::page::{FrameId, GetFrameTreeParams};
+use chromiumoxide_cdp::cdp::browser_protocol::page::{
+    CreateIsolatedWorldParams, FrameId, GetFrameTreeParams,
+};
 use chromiumoxide_cdp::cdp::browser_protocol::{
     browser::BrowserContextId,
     log as cdplog, performance,
@@ -286,7 +288,13 @@ impl Target {
             // tightening: 1,722 initialization responses over launch, connect,
             // two concurrent clients, OOPIF/worker pages and tabs closed
             // mid-initialization — none was an error.
-            if let Some(err) = &resp.error {
+            if let Some(err) = resp.error.as_ref().filter(|_| {
+                // One per frame, for the frames the tree had a moment ago: a
+                // frame that went away meanwhile refuses it, and that is frame
+                // churn, not a failed page (codex). The page still works; that
+                // frame simply has no utility world.
+                method != CreateIsolatedWorldParams::IDENTIFIER
+            }) {
                 tracing::warn!(
                     target_id = ?self.info.target_id,
                     method,
@@ -408,9 +416,13 @@ impl Target {
         }
         self.init_state = TargetInit::Closing;
         let close_target = CloseTargetParams::new(self.info.target_id.clone());
+        // Sent on the browser's own session, by target id: the page's session
+        // may be the thing that failed (`Session with given id not found`),
+        // and Chrome would refuse the close on it too, leaving the tab open
+        // and this target stuck Closing (codex).
         TargetEvent::Request(Request {
             method: close_target.identifier(),
-            session_id: self.session_id.clone().map(Into::into),
+            session_id: None,
             params: serde_json::to_value(close_target).unwrap(),
         })
     }
@@ -955,7 +967,12 @@ mod init_error_tests {
             "Page.enable",
         );
         match poll(&mut t) {
-            Some(TargetEvent::Request(req)) => assert_eq!(req.method, "Target.closeTarget"),
+            Some(TargetEvent::Request(req)) => {
+                assert_eq!(req.method, "Target.closeTarget");
+                // On the browser session: the page session may be what failed.
+                assert!(req.session_id.is_none(), "{req:?}");
+                assert_eq!(req.params["targetId"], "T1");
+            }
             other => panic!("expected the target to be closed, got {other:?}"),
         }
         assert!(matches!(t.init_state, TargetInit::Closing));
@@ -965,6 +982,18 @@ mod init_error_tests {
             }
             other => panic!("the waiter should get Chrome's error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_vanished_frame_refusing_its_isolated_world_is_not_a_failure() {
+        let mut t = page_target();
+        assert!(matches!(poll(&mut t), Some(TargetEvent::Request(_))));
+        t.on_response(
+            reply(Some((-32000, "No frame for given id found"))),
+            CreateIsolatedWorldParams::IDENTIFIER,
+        );
+        assert!(t.init_error.is_none());
+        assert!(!matches!(t.init_state, TargetInit::Closing));
     }
 
     #[test]
