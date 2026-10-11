@@ -229,6 +229,17 @@ impl Target {
         self.begin_reattach(now, false);
     }
 
+    /// Discovery named this already-tracked target again (screen-play-rs#1041):
+    /// refresh its metadata, and — if it should be attached, has no session
+    /// and nothing is attaching it — start the same in-place re-attach a lost
+    /// session starts, within the recovery budget. Never a replacement.
+    pub(crate) fn on_rediscovered(&mut self, info: &TargetInfo, now: Instant) {
+        self.refresh_metadata(info);
+        if self.wants_revival() {
+            self.begin_reattach(now, false);
+        }
+    }
+
     /// Whether discovery should start a re-attach for this target: it should
     /// be attached, has no session, and nothing is already attaching it.
     pub(crate) fn wants_revival(&self) -> bool {
@@ -1389,6 +1400,30 @@ mod session_recovery_tests {
             Instant::now() + RECOVERY_WINDOW + Duration::from_secs(1),
             false
         ));
+    }
+
+    #[test]
+    fn rediscovery_re_attaches_a_detached_target_that_should_be_attached() {
+        let mut t = initialized("S1");
+        let info = t.info().clone();
+        // Spend the budget so the lost session is left detached.
+        let now = Instant::now();
+        for _ in 0..RECOVERY_BUDGET {
+            assert!(t.begin_reattach(now, false));
+            drive(&mut t, "S1");
+        }
+        t.on_session_lost(now);
+        assert!(cx_poll(&mut t).is_none());
+        // Discovery after the window: an attach, on the same target.
+        t.on_rediscovered(&info, now + RECOVERY_WINDOW + Duration::from_secs(1));
+        let sent = drive(&mut t, "S2");
+        assert_eq!(methods(&sent)[0], AttachToTargetParams::IDENTIFIER);
+        assert!(t.is_initialized());
+        // An intentionally detached one is only refreshed.
+        t.set_desired_attached(false);
+        t.on_session_lost(now);
+        t.on_rediscovered(&info, now + RECOVERY_WINDOW * 3);
+        assert!(cx_poll(&mut t).is_none());
     }
 
     #[test]

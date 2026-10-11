@@ -481,10 +481,7 @@ impl Handler {
             // Do not let its metadata freeze at the first snapshot — this
             // crate does not handle `Target.targetInfoChanged`, so discovery
             // is the only refresh.
-            existing.refresh_metadata(&event.target_info);
-            if existing.wants_revival() {
-                existing.begin_reattach(Instant::now(), false);
-            }
+            existing.on_rediscovered(&event.target_info, Instant::now());
             return;
         }
         let browser_ctx = event
