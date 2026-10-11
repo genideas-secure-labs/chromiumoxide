@@ -77,6 +77,41 @@ impl NetworkManager {
             .push_back(NetworkEvent::SendCdpRequest((method, params)));
     }
 
+    /// Forget the requests of the DevTools session that just ended
+    /// (screen-play-rs#1041). The user's settings — extra headers, cache,
+    /// credentials, interception, offline — are kept; `reapply_session_state`
+    /// sends them to the new session.
+    pub fn on_session_replaced(&mut self) {
+        self.queued_events.clear();
+        self.requests.clear();
+        self.requests_will_be_sent.clear();
+        self.request_id_to_interception_id.clear();
+        self.attempted_authentications.clear();
+        // The `Fetch` domain was enabled on the old session only.
+        self.protocol_request_interception_enabled = false;
+    }
+
+    /// Send the settings this manager holds to a freshly attached session:
+    /// a re-attached target must not silently lose request interception,
+    /// authentication, extra headers, cache or offline mode (screen-play-rs#1041).
+    pub fn reapply_session_state(&mut self) {
+        if !self.extra_headers.is_empty() {
+            let headers = serde_json::to_value(self.extra_headers.clone()).unwrap();
+            self.push_cdp_request(SetExtraHttpHeadersParams::new(Headers::new(headers)));
+        }
+        let intercept = self.user_request_interception_enabled || self.credentials.is_some();
+        if intercept {
+            // Also re-sends the cache setting, as enabling interception does.
+            self.update_protocol_request_interception();
+        } else if self.user_cache_disabled {
+            self.update_protocol_cache_disabled();
+        }
+        if self.offline {
+            self.offline = false;
+            self.set_offline_mode(true);
+        }
+    }
+
     /// The next event to handle
     pub fn poll(&mut self) -> Option<NetworkEvent> {
         self.queued_events.pop_front()

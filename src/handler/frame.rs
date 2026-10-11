@@ -211,6 +211,20 @@ impl FrameManager {
         }
     }
 
+    /// Forget what belonged to the DevTools session that just ended
+    /// (screen-play-rs#1041): execution contexts and isolated worlds are
+    /// per-session, so a re-attached session must create them again — the
+    /// initialization chain does, once `isolated_worlds` no longer claims them.
+    /// Frames themselves stay: the page did not navigate, and the chain's
+    /// `Page.getFrameTree` refreshes them.
+    pub fn on_session_replaced(&mut self) {
+        for frame in self.frames.values_mut() {
+            frame.clear_contexts();
+        }
+        self.context_ids.clear();
+        self.isolated_worlds.clear();
+    }
+
     /// The commands to execute in order to initialize this frame manager.
     /// The `_stealth_mode` parameter is reserved for future per-command control.
     pub fn init_commands(timeout: Duration, _stealth_mode: bool) -> CommandChain {

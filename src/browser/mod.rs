@@ -431,6 +431,41 @@ impl Browser {
         Ok(rx.await?)
     }
 
+    /// Detach this client from a target on purpose: the tab keeps running and
+    /// is not re-attached — not by discovery, not after a lost session — until
+    /// [`Browser::reattach_target`] (screen-play-rs#1041). Detaching a target
+    /// with no session only records the intent.
+    pub async fn detach_target(&self, target_id: TargetId) -> Result<()> {
+        let (tx, rx) = oneshot_channel();
+        self.sender
+            .clone()
+            .send(HandlerMessage::SetDesiredAttachment(target_id, false, tx))
+            .await?;
+        if let Some(session_id) = rx.await? {
+            self.execute(
+                crate::cdp::browser_protocol::target::DetachFromTargetParams::builder()
+                    .session_id(session_id)
+                    .build(),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Attach to a target again — after [`Browser::detach_target`], or when
+    /// it lost its session and recovery gave up — on a new session, keeping
+    /// the target's network settings and listeners, and return its page once
+    /// the session is initialized. A target that is attached and initialized
+    /// is returned as is (screen-play-rs#1041).
+    pub async fn reattach_target(&self, target_id: TargetId) -> Result<Page> {
+        let (tx, rx) = oneshot_channel();
+        self.sender
+            .clone()
+            .send(HandlerMessage::Reattach(target_id, tx))
+            .await?;
+        rx.await?
+    }
+
     /// Return page of given target_id
     pub async fn get_page(&self, target_id: TargetId) -> Result<Page> {
         let (tx, rx) = oneshot_channel();

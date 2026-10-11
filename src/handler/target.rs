@@ -43,8 +43,43 @@ use chromiumoxide_cdp::cdp::js_protocol::runtime::{
 };
 use std::time::Duration;
 
+/// At most this many automatic re-attaches per target within
+/// [`RECOVERY_WINDOW`] (screen-play-rs#1041) — a session that keeps dropping
+/// must not turn into an attach loop.
+pub const RECOVERY_BUDGET: usize = 3;
+/// See [`RECOVERY_BUDGET`].
+pub const RECOVERY_WINDOW: Duration = Duration::from_secs(60);
+
+/// Sent to a target's event listeners each time it finishes re-attaching on a
+/// new DevTools session (screen-play-rs#1041). State this crate holds
+/// (network settings, isolated worlds, viewport) is already re-applied; state
+/// a caller set on the old session directly — a user-agent override, init
+/// scripts, anything sent through `Page::execute` — is gone, and the caller
+/// re-applies it on seeing this. `Page` handles bound to the old session are
+/// stale; fetch the page again.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventSessionRestored {
+    pub target_id: String,
+    /// 1 after the first re-attach, 2 after the second, …
+    pub generation: u64,
+}
+
+impl chromiumoxide_types::MethodType for EventSessionRestored {
+    fn method_id() -> chromiumoxide_types::MethodId {
+        "Chromiumoxide.sessionRestored".into()
+    }
+}
+impl crate::cdp::CustomEvent for EventSessionRestored {}
+
 macro_rules! advance_state {
     ($s:ident, $cx:ident, $now:ident, $cmds: ident, $next_state:expr ) => {{
+        // No session, no commands — every initialization state, not only the
+        // first (screen-play-rs#1041). A lost session is handled by
+        // `on_session_lost`, which re-attaches or leaves the target detached.
+        if $s.session_id.is_none() {
+            return None;
+        }
         if let Poll::Ready(poll) = $cmds.poll($now) {
             return match poll {
                 None => {
@@ -56,7 +91,10 @@ macro_rules! advance_state {
                     session_id: $s.session_id.clone().map(Into::into),
                     params,
                 })),
-                Some(Err(_)) => Some($s.on_initialization_failed()),
+                Some(Err(_)) => {
+                    let ev = $s.on_initialization_failed($now);
+                    $s.continue_after_failure(ev, $cx, $now)
+                }
             };
         } else {
             return None;
@@ -98,6 +136,23 @@ pub struct Target {
     wait_for_frame_navigation: Vec<Sender<ArcHttpRequest>>,
     /// The sender who requested the page.
     initiator: Option<Sender<Result<Page>>>,
+    /// Whether this target should have a session (screen-play-rs#1041). True
+    /// until `Browser::detach_target`; `Browser::reattach_target` sets it
+    /// again. A lost session is recovered only while this is true — an
+    /// intentional detach stays detached.
+    desired_attached: bool,
+    /// A `Target.attachToTarget` was sent and its session has not arrived.
+    attach_in_flight: bool,
+    /// The current initialization is a re-attach of a target that was already
+    /// initialized once: on success its network settings are re-applied and
+    /// `EventSessionRestored` is sent; on failure it is not closed.
+    reattaching: bool,
+    /// Start times of the automatic re-attaches inside [`RECOVERY_WINDOW`].
+    recoveries: VecDeque<Instant>,
+    /// How many re-attaches have completed.
+    session_generation: u64,
+    /// Whoever called `Browser::reattach_target` and waits for the page.
+    reattach_waiter: Option<Sender<Result<Page>>>,
 }
 
 impl Target {
@@ -127,11 +182,129 @@ impl Target {
             event_listeners: Default::default(),
             initiator: None,
             browser_context,
+            desired_attached: true,
+            attach_in_flight: false,
+            reattaching: false,
+            recoveries: VecDeque::new(),
+            session_generation: 0,
+            reattach_waiter: None,
         }
     }
 
     pub fn set_session_id(&mut self, id: SessionId) {
-        self.session_id = Some(id)
+        self.session_id = Some(id);
+        self.attach_in_flight = false;
+    }
+
+    /// Whether this target should have a session (screen-play-rs#1041).
+    pub fn desired_attached(&self) -> bool {
+        self.desired_attached
+    }
+
+    /// Record whether this target should have a session. `false` is what an
+    /// intentional detach sets first, so the detach that follows is not
+    /// mistaken for a lost session.
+    pub fn set_desired_attached(&mut self, desired: bool) {
+        self.desired_attached = desired;
+    }
+
+    /// How many re-attaches have completed on this target.
+    pub fn session_generation(&self) -> u64 {
+        self.session_generation
+    }
+
+    /// The current session ended (screen-play-rs#1041). Drops what was bound
+    /// to it and, if this target should stay attached, re-attaches it — the
+    /// same `Target`, so its managers, listeners and waiters survive.
+    pub(crate) fn on_session_lost(&mut self, now: Instant) {
+        self.session_id = None;
+        self.attach_in_flight = false;
+        self.clear_page();
+        if !self.desired_attached || matches!(self.init_state, TargetInit::Closing) {
+            return;
+        }
+        if !self.is_page() {
+            return;
+        }
+        self.begin_reattach(now, false);
+    }
+
+    /// Whether discovery should start a re-attach for this target: it should
+    /// be attached, has no session, and nothing is already attaching it.
+    pub(crate) fn wants_revival(&self) -> bool {
+        self.is_page()
+            && self.desired_attached
+            && self.session_id.is_none()
+            && !self.attach_in_flight
+            && !matches!(
+                self.init_state,
+                TargetInit::Closing | TargetInit::AttachToTarget
+            )
+    }
+
+    /// Start re-attaching this target on a new session. `explicit` is a
+    /// caller's `reattach_target`, which is not rationed; an automatic
+    /// recovery spends one unit of [`RECOVERY_BUDGET`], and none is started
+    /// once that is spent. Returns whether a re-attach was started.
+    pub(crate) fn begin_reattach(&mut self, now: Instant, explicit: bool) -> bool {
+        if explicit {
+            self.recoveries.clear();
+        } else {
+            while self
+                .recoveries
+                .front()
+                .is_some_and(|t| now.duration_since(*t) > RECOVERY_WINDOW)
+            {
+                self.recoveries.pop_front();
+            }
+            if self.recoveries.len() >= RECOVERY_BUDGET {
+                tracing::warn!(
+                    target_id = ?self.info.target_id,
+                    budget = RECOVERY_BUDGET,
+                    "session recovery budget spent; leaving the target detached"
+                );
+                return false;
+            }
+            self.recoveries.push_back(now);
+        }
+        self.session_id = None;
+        self.attach_in_flight = false;
+        self.init_error = None;
+        self.clear_page();
+        self.frame_manager.on_session_replaced();
+        self.network_manager.on_session_replaced();
+        self.reattaching = true;
+        self.init_state = TargetInit::AttachToTarget;
+        true
+    }
+
+    /// Re-attach on a caller's request (`Browser::reattach_target`). An
+    /// attached, initialized target answers at once; otherwise the page is
+    /// sent to `tx` when the new session finishes initializing.
+    pub(crate) fn reattach(&mut self, now: Instant, tx: Sender<Result<Page>>) {
+        self.desired_attached = true;
+        if self.session_id.is_some() && self.is_initialized() {
+            match self.get_or_create_page() {
+                Some(page) => {
+                    let _ = tx.send(Ok(page.clone().into()));
+                }
+                None => {
+                    let _ = tx.send(Err(CdpError::NotFound));
+                }
+            }
+            return;
+        }
+        if let Some(previous) = self.reattach_waiter.replace(tx) {
+            let _ = previous.send(Err(CdpError::msg(
+                "superseded by a later reattach_target for the same target",
+            )));
+        }
+        let attaching = self.attach_in_flight
+            || matches!(self.init_state, TargetInit::AttachToTarget)
+            || (self.session_id.is_some() && self.init_state.commands_mut().is_some());
+        if !attaching {
+            self.begin_reattach(now, true);
+        }
     }
 
     /// Refresh the metadata that can legitimately change while a target lives.
@@ -403,14 +576,48 @@ impl Target {
         });
     }
 
-    /// Called when a init command timed out
-    fn on_initialization_failed(&mut self) -> TargetEvent {
-        self.fail_initialization(CdpError::Timeout)
+    /// What a poll returns after a failed initialization: the close request,
+    /// or — when a re-attach is retrying — the retry's attach right away. A
+    /// `None` here would leave the target unpolled until something else woke
+    /// the handler.
+    fn continue_after_failure(
+        &mut self,
+        ev: Option<TargetEvent>,
+        cx: &mut Context<'_>,
+        now: Instant,
+    ) -> Option<TargetEvent> {
+        if ev.is_none() && matches!(self.init_state, TargetInit::AttachToTarget) {
+            return self.poll(cx, now);
+        }
+        ev
     }
 
-    /// End a failed initialization: report `error` to whoever waits for the
-    /// page, and close the target.
-    fn fail_initialization(&mut self, error: CdpError) -> TargetEvent {
+    /// Called when a init command timed out
+    fn on_initialization_failed(&mut self, now: Instant) -> Option<TargetEvent> {
+        self.fail_initialization(CdpError::Timeout, now)
+    }
+
+    /// End a failed initialization. A target initializing for the first time
+    /// reports `error` to whoever waits and is closed. A RE-attach is not
+    /// closed — the tab is the user's — but reports `error` to a waiting
+    /// `reattach_target` and, if it should stay attached, tries again within
+    /// [`RECOVERY_BUDGET`] (the error may be the old session's last word);
+    /// once that is spent it stays detached (screen-play-rs#1041).
+    fn fail_initialization(&mut self, error: CdpError, now: Instant) -> Option<TargetEvent> {
+        if self.reattaching {
+            if let Some(waiter) = self.reattach_waiter.take() {
+                let _ = waiter.send(Err(error));
+            }
+            if self.desired_attached && self.begin_reattach(now, false) {
+                return None;
+            }
+            self.reattaching = false;
+            self.session_id = None;
+            self.attach_in_flight = false;
+            self.clear_page();
+            self.init_state = TargetInit::Initialized;
+            return None;
+        }
         if let Some(initiator) = self.initiator.take() {
             let _ = initiator.send(Err(error));
         }
@@ -420,11 +627,11 @@ impl Target {
         // may be the thing that failed (`Session with given id not found`),
         // and Chrome would refuse the close on it too, leaving the tab open
         // and this target stuck Closing (codex).
-        TargetEvent::Request(Request {
+        Some(TargetEvent::Request(Request {
             method: close_target.identifier(),
             session_id: None,
             params: serde_json::to_value(close_target).unwrap(),
-        })
+        }))
     }
 
     /// Advance that target's state
@@ -435,7 +642,8 @@ impl Target {
         }
         if self.init_state.commands_mut().is_some() {
             if let Some((_method, err)) = self.init_error.take() {
-                return Some(self.fail_initialization(CdpError::Chrome(err)));
+                let ev = self.fail_initialization(CdpError::Chrome(err), now);
+                return self.continue_after_failure(ev, cx, now);
             }
         }
         match &mut self.init_state {
@@ -449,6 +657,7 @@ impl Target {
                     .flatten(true)
                     .build()
                     .unwrap();
+                self.attach_in_flight = true;
 
                 return Some(TargetEvent::Request(Request::new(
                     params.identifier(),
@@ -489,7 +698,10 @@ impl Target {
                             session_id: self.session_id.clone().map(Into::into),
                             params,
                         })),
-                        Some(Err(_)) => Some(self.on_initialization_failed()),
+                        Some(Err(_)) => {
+                            let ev = self.on_initialization_failed(now);
+                            self.continue_after_failure(ev, cx, now)
+                        }
                     };
                 } else {
                     return None;
@@ -525,6 +737,34 @@ impl Target {
                 advance_state!(self, cx, now, cmds, TargetInit::Initialized);
             }
             TargetInit::Initialized => {
+                if self.reattaching && self.session_id.is_some() {
+                    // A re-attach just finished (screen-play-rs#1041): put the
+                    // network settings back on the new session, tell listeners
+                    // the session changed, and hand the page to a waiting
+                    // `reattach_target` — without waiting for a load, since
+                    // the page did not navigate.
+                    self.reattaching = false;
+                    self.session_generation += 1;
+                    self.network_manager.reapply_session_state();
+                    let restored = EventSessionRestored {
+                        target_id: self.info.target_id.inner().to_string(),
+                        generation: self.session_generation,
+                    };
+                    let _ = self.event_listeners.try_send_custom(
+                        "Chromiumoxide.sessionRestored",
+                        serde_json::to_value(&restored).unwrap(),
+                    );
+                    if let Some(waiter) = self.reattach_waiter.take() {
+                        match self.get_or_create_page() {
+                            Some(page) => {
+                                let _ = waiter.send(Ok(page.clone().into()));
+                            }
+                            None => {
+                                let _ = waiter.send(Err(CdpError::NotFound));
+                            }
+                        }
+                    }
+                }
                 if let Some(initiator) = self.initiator.take() {
                     // make sure that the main frame of the page has finished loading
                     if self
@@ -1012,5 +1252,241 @@ mod init_error_tests {
         t.on_response(reply(Some((-32000, "boom"))), "Runtime.evaluate");
         assert!(t.init_error.is_none());
         assert!(matches!(t.init_state, TargetInit::Initialized));
+    }
+}
+
+#[cfg(test)]
+mod session_recovery_tests {
+    //! screen-play-rs#1041: a target that loses its session re-attaches in
+    //! place — keeping its network settings and listeners — unless it was
+    //! detached on purpose, within a recovery budget.
+    use super::*;
+    use crate::listeners::{EventListenerRequest, EventStream};
+    use futures::StreamExt;
+    use std::task::Context;
+
+    fn target() -> Target {
+        let info: TargetInfo = serde_json::from_value(serde_json::json!({
+            "targetId": "T1", "type": "page", "title": "", "url": "about:blank",
+            "attached": false, "canAccessOpener": false
+        }))
+        .unwrap();
+        Target::new(info, TargetConfig::default(), BrowserContext::default())
+    }
+
+    fn cx_poll(t: &mut Target) -> Option<TargetEvent> {
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let ev = t.poll(&mut cx, Instant::now());
+        t.event_listeners_mut().poll(&mut cx);
+        ev
+    }
+
+    /// Poll and answer every request with success until the target asks for
+    /// nothing more; the attach is answered by giving it `session`. Returns
+    /// every request sent, in order.
+    fn drive(t: &mut Target, session: &str) -> Vec<Request> {
+        let mut sent = Vec::new();
+        for _ in 0..500 {
+            match cx_poll(t) {
+                Some(TargetEvent::Request(req)) => {
+                    let method = req.method.to_string();
+                    sent.push(req);
+                    if method == AttachToTargetParams::IDENTIFIER {
+                        t.set_session_id(SessionId::from(session.to_string()));
+                    }
+                    t.on_response(
+                        Response {
+                            id: chromiumoxide_types::CallId::new(1),
+                            result: Some(serde_json::json!({})),
+                            error: None,
+                        },
+                        &method,
+                    );
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        sent
+    }
+
+    fn methods(sent: &[Request]) -> Vec<String> {
+        sent.iter().map(|r| r.method.to_string()).collect()
+    }
+
+    fn initialized(session: &str) -> Target {
+        let mut t = target();
+        drive(&mut t, session);
+        assert!(t.is_initialized());
+        assert_eq!(t.session_generation(), 0);
+        t
+    }
+
+    #[test]
+    fn a_lost_session_re_attaches_in_place_and_restores_network_state() {
+        let mut t = initialized("S1");
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        t.event_listeners_mut()
+            .add_listener(EventListenerRequest::new::<EventSessionRestored>(tx));
+        let mut restored = EventStream::<EventSessionRestored>::new(rx);
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("x-a".to_string(), "1".to_string());
+        t.network_manager.set_extra_headers(headers);
+        drive(&mut t, "S1"); // flush the header command on S1
+
+        t.on_session_lost(Instant::now());
+        let sent = drive(&mut t, "S2");
+        let names = methods(&sent);
+        assert_eq!(names[0], AttachToTargetParams::IDENTIFIER, "{names:?}");
+        assert!(names.contains(&"Page.enable".to_string()), "{names:?}");
+        // The header the user set is sent again — on the NEW session.
+        let reapplied = sent
+            .iter()
+            .find(|r| r.method == "Network.setExtraHTTPHeaders")
+            .unwrap_or_else(|| panic!("headers not re-applied: {names:?}"));
+        assert_eq!(reapplied.session_id.as_deref(), Some("S2"));
+        assert!(t.is_initialized());
+        assert_eq!(t.session_generation(), 1);
+        let ev = futures::executor::block_on(restored.next()).unwrap();
+        assert_eq!(ev.target_id, "T1");
+        assert_eq!(ev.generation, 1);
+    }
+
+    #[test]
+    fn an_intentional_detach_stays_detached() {
+        let mut t = initialized("S1");
+        t.set_desired_attached(false);
+        t.on_session_lost(Instant::now());
+        assert!(
+            cx_poll(&mut t).is_none(),
+            "no attach after an intentional detach"
+        );
+        assert!(!t.wants_revival(), "discovery must not revive it either");
+        assert_eq!(t.session_generation(), 0);
+    }
+
+    #[test]
+    fn discovery_revives_only_what_should_be_attached() {
+        let mut t = initialized("S1");
+        // Recovery gave up (budget) and left it detached.
+        for _ in 0..RECOVERY_BUDGET {
+            assert!(t.begin_reattach(Instant::now(), false));
+            drive(&mut t, "S1");
+        }
+        t.on_session_lost(Instant::now());
+        assert!(cx_poll(&mut t).is_none(), "the budget is spent");
+        assert!(t.session_id().is_none());
+        // Discovery would revive it only once the window allows.
+        assert!(t.wants_revival());
+        assert!(!t.begin_reattach(Instant::now(), false));
+        assert!(t.begin_reattach(
+            Instant::now() + RECOVERY_WINDOW + Duration::from_secs(1),
+            false
+        ));
+    }
+
+    #[test]
+    fn the_recovery_budget_stops_an_attach_loop() {
+        let mut t = initialized("S1");
+        let now = Instant::now();
+        let mut attaches = 0;
+        for _ in 0..(RECOVERY_BUDGET + 3) {
+            t.on_session_lost(now);
+            let sent = drive(&mut t, "S1");
+            attaches += methods(&sent)
+                .iter()
+                .filter(|m| *m == AttachToTargetParams::IDENTIFIER)
+                .count();
+        }
+        assert_eq!(attaches, RECOVERY_BUDGET);
+    }
+
+    #[test]
+    fn a_session_lost_mid_initialization_is_recovered_and_sends_nothing_meanwhile() {
+        let mut t = target();
+        // Attach, get the session, answer a few init commands.
+        assert!(matches!(cx_poll(&mut t), Some(TargetEvent::Request(_))));
+        t.set_session_id(SessionId::from("S1".to_string()));
+        for _ in 0..3 {
+            if let Some(TargetEvent::Request(req)) = cx_poll(&mut t) {
+                let m = req.method.to_string();
+                t.on_response(
+                    Response {
+                        id: chromiumoxide_types::CallId::new(1),
+                        result: Some(serde_json::json!({})),
+                        error: None,
+                    },
+                    &m,
+                );
+            }
+        }
+        assert!(t.init_state.commands_mut().is_some());
+        t.on_session_lost(Instant::now());
+        let sent = drive(&mut t, "S2");
+        let names = methods(&sent);
+        assert_eq!(names[0], AttachToTargetParams::IDENTIFIER, "{names:?}");
+        assert!(
+            sent[1..]
+                .iter()
+                .all(|r| r.session_id.as_deref() == Some("S2")),
+            "{names:?}"
+        );
+        assert!(t.is_initialized());
+    }
+
+    #[test]
+    fn no_initialization_state_sends_without_a_session() {
+        let mut t = initialized("S1");
+        t.set_desired_attached(false);
+        // Put it back mid-chain with no session, as an intentional detach
+        // during initialization leaves it.
+        t.init_state = TargetInit::InitializingNetwork(t.network_manager.init_commands());
+        t.on_session_lost(Instant::now());
+        assert!(cx_poll(&mut t).is_none());
+    }
+
+    #[test]
+    fn a_failed_re_attach_does_not_close_the_tab() {
+        let mut t = initialized("S1");
+        t.on_session_lost(Instant::now());
+        assert!(matches!(cx_poll(&mut t), Some(TargetEvent::Request(_)))); // attach
+        t.set_session_id(SessionId::from("S2".to_string()));
+        t.on_response(
+            Response {
+                id: chromiumoxide_types::CallId::new(1),
+                result: None,
+                error: Some(chromiumoxide_types::Error {
+                    code: -32001,
+                    message: "Session with given id not found.".into(),
+                }),
+            },
+            "Page.enable",
+        );
+        // Not closed: it tries again (an attach), within the budget.
+        match cx_poll(&mut t) {
+            Some(TargetEvent::Request(req)) => {
+                assert_eq!(req.method, AttachToTargetParams::IDENTIFIER, "{req:?}")
+            }
+            other => panic!("expected a retry attach, got {other:?}"),
+        }
+        assert!(!matches!(t.init_state, TargetInit::Closing));
+    }
+
+    #[test]
+    fn reattach_target_after_an_intentional_detach_hands_back_the_page() {
+        let mut t = initialized("S1");
+        t.set_desired_attached(false);
+        t.on_session_lost(Instant::now());
+        assert!(cx_poll(&mut t).is_none());
+        let (tx, mut rx) = futures::channel::oneshot::channel();
+        t.reattach(Instant::now(), tx);
+        assert!(t.desired_attached());
+        drive(&mut t, "S2");
+        match rx.try_recv() {
+            Ok(Some(Ok(page))) => assert_eq!(page.session_id().as_ref(), "S2"),
+            other => panic!("expected the re-attached page, got {other:?}"),
+        }
+        assert_eq!(t.session_generation(), 1);
     }
 }

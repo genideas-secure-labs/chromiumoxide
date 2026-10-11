@@ -468,15 +468,24 @@ impl Handler {
         // The init-failure path does not need this: `on_initialization_failed`
         // moves the target to `Closing` and sends `Target.closeTarget`, and the
         // resulting `targetDestroyed` removes the entry outright.
+        //
+        // screen-play-rs#1041 changed the second half: discovery no longer
+        // REPLACES a target that lost its session — replacing threw away its
+        // network settings, listeners and page channel, and could not tell an
+        // intentional detach from a lost session. A tracked target is never
+        // replaced. If it should be attached and has no session, discovery
+        // starts the same in-place re-attach a lost session starts (rationed
+        // by the recovery budget); a target detached on purpose
+        // (`Browser::detach_target`) is left alone.
         if let Some(existing) = self.targets.get_mut(&event.target_info.target_id) {
-            let stranded = existing.is_initialized() && existing.session_id().is_none();
-            if !stranded {
-                // Keep the live target, but do not let its metadata freeze at
-                // the first snapshot — this crate does not handle
-                // `Target.targetInfoChanged`, so discovery is the only refresh.
-                existing.refresh_metadata(&event.target_info);
-                return;
+            // Do not let its metadata freeze at the first snapshot — this
+            // crate does not handle `Target.targetInfoChanged`, so discovery
+            // is the only refresh.
+            existing.refresh_metadata(&event.target_info);
+            if existing.wants_revival() {
+                existing.begin_reattach(Instant::now(), false);
             }
+            return;
         }
         let browser_ctx = event
             .target_info
@@ -562,7 +571,10 @@ impl Handler {
                 // would spuriously return `CdpError::NotFound`.
                 let is_current = target.session_id() == Some(&event.session_id);
                 if is_current {
-                    target.session_id_mut().take();
+                    // screen-play-rs#1041: the target decides what follows —
+                    // re-attach in place if it should stay attached, stay
+                    // detached if it was detached on purpose.
+                    target.on_session_lost(Instant::now());
                     // Also drop the cached PageHandle so any caller
                     // that races a `Target.attachToTarget` reply against
                     // the matching `attachedToTarget` event window —
@@ -685,6 +697,21 @@ impl Stream for Handler {
                             .and_then(|target| target.get_or_create_page())
                             .map(|page| Page::from(page.clone()));
                         let _ = tx.send(page);
+                    }
+                    HandlerMessage::SetDesiredAttachment(target_id, desired, tx) => {
+                        let session = pin.targets.get_mut(&target_id).and_then(|target| {
+                            target.set_desired_attached(desired);
+                            target.session_id().cloned()
+                        });
+                        let _ = tx.send(session);
+                    }
+                    HandlerMessage::Reattach(target_id, tx) => {
+                        match pin.targets.get_mut(&target_id) {
+                            Some(target) => target.reattach(now, tx),
+                            None => {
+                                let _ = tx.send(Err(CdpError::NotFound));
+                            }
+                        }
                     }
                     HandlerMessage::AddEventListener(req) => {
                         pin.event_listeners.add_listener(req);
@@ -883,6 +910,11 @@ pub(crate) enum HandlerMessage {
     GetPages(OneshotSender<Vec<Page>>),
     Command(CommandMessage),
     GetPage(TargetId, OneshotSender<Option<Page>>),
+    /// Record whether a target should stay attached; answers with its current
+    /// session (screen-play-rs#1041).
+    SetDesiredAttachment(TargetId, bool, OneshotSender<Option<SessionId>>),
+    /// Re-attach a target in place and answer with its page once initialized.
+    Reattach(TargetId, OneshotSender<Result<Page>>),
     AddEventListener(EventListenerRequest),
     CloseBrowser(OneshotSender<Result<CloseReturns>>),
 }
