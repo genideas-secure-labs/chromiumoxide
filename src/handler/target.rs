@@ -206,6 +206,29 @@ impl Target {
     /// mistaken for a lost session.
     pub fn set_desired_attached(&mut self, desired: bool) {
         self.desired_attached = desired;
+        // An attach not sent yet is not sent at all (codex R1). One already in
+        // flight is refused by the handler when its session arrives.
+        if !desired && matches!(self.init_state, TargetInit::AttachToTarget) {
+            self.abandon_attachment();
+        }
+    }
+
+    /// Give up an attachment that will not happen — the target was detached
+    /// on purpose before it finished — and tell whoever waits for its page.
+    pub(crate) fn abandon_attachment(&mut self) {
+        self.attach_in_flight = false;
+        self.reattaching = false;
+        self.init_error = None;
+        let detached = || {
+            CdpError::msg("the target was detached before its session finished initializing")
+        };
+        if let Some(initiator) = self.initiator.take() {
+            let _ = initiator.send(Err(detached()));
+        }
+        if let Some(waiter) = self.reattach_waiter.take() {
+            let _ = waiter.send(Err(detached()));
+        }
+        self.init_state = TargetInit::Initialized;
     }
 
     /// How many re-attaches have completed on this target.
@@ -220,7 +243,17 @@ impl Target {
         self.session_id = None;
         self.attach_in_flight = false;
         self.clear_page();
-        if !self.desired_attached || matches!(self.init_state, TargetInit::Closing) {
+        if matches!(self.init_state, TargetInit::Closing) {
+            return;
+        }
+        if !self.desired_attached {
+            // Detached on purpose while still initializing: nothing will
+            // finish that initialization, so whoever waits is told now.
+            if self.init_state.commands_mut().is_some()
+                || matches!(self.init_state, TargetInit::AttachToTarget)
+            {
+                self.abandon_attachment();
+            }
             return;
         }
         if !self.is_page() {
@@ -616,18 +649,36 @@ impl Target {
     /// once that is spent it stays detached (screen-play-rs#1041).
     fn fail_initialization(&mut self, error: CdpError, now: Instant) -> Option<TargetEvent> {
         if self.reattaching {
-            if let Some(waiter) = self.reattach_waiter.take() {
-                let _ = waiter.send(Err(error));
-            }
+            // The failed attempt's session may still be live: end it, or every
+            // retry leaves one more session behind whose events reach this
+            // target (codex R1). On the browser session, by session id.
+            let failed_session = self.session_id.take();
+            let detach_failed = failed_session.map(|session| {
+                let params = DetachFromTargetParams::builder().session_id(session).build();
+                TargetEvent::Request(Request {
+                    method: params.identifier(),
+                    session_id: None,
+                    params: serde_json::to_value(params).unwrap(),
+                })
+            });
             if self.desired_attached && self.begin_reattach(now, false) {
-                return None;
+                // The waiters keep waiting for the retry.
+                return detach_failed;
+            }
+            // Giving up: whoever waits — `reattach_target`, or the original
+            // `new_page` whose first initialization lost its session — gets
+            // the error instead of waiting forever (codex R1).
+            if let Some(waiter) = self.reattach_waiter.take() {
+                let _ = waiter.send(Err(CdpError::msg(error.to_string())));
+            }
+            if let Some(initiator) = self.initiator.take() {
+                let _ = initiator.send(Err(error));
             }
             self.reattaching = false;
-            self.session_id = None;
             self.attach_in_flight = false;
             self.clear_page();
             self.init_state = TargetInit::Initialized;
-            return None;
+            return detach_failed;
         }
         if let Some(initiator) = self.initiator.take() {
             let _ = initiator.send(Err(error));
@@ -757,6 +808,19 @@ impl Target {
                     self.reattaching = false;
                     self.session_generation += 1;
                     self.network_manager.reapply_session_state();
+                    // Queue the re-applied settings NOW, ahead of anything a
+                    // woken caller sends: queued events are submitted before
+                    // the page's own commands are read (codex R1), so the
+                    // first request after a re-attach already has them.
+                    while let Some(event) = self.network_manager.poll() {
+                        if let NetworkEvent::SendCdpRequest((method, params)) = event {
+                            self.queued_events.push_back(TargetEvent::Request(Request {
+                                method,
+                                session_id: self.session_id.clone().map(Into::into),
+                                params,
+                            }));
+                        }
+                    }
                     let restored = EventSessionRestored {
                         target_id: self.info.target_id.inner().to_string(),
                         generation: self.session_generation,
@@ -767,6 +831,11 @@ impl Target {
                     );
                     self.queued_events
                         .push_back(TargetEvent::SessionRestored(restored));
+                }
+                // A `reattach_target` that arrived while this target was still
+                // attaching (first time or not) is answered by ANY successful
+                // initialization, not only a recovery (codex R1).
+                if self.session_id.is_some() {
                     if let Some(waiter) = self.reattach_waiter.take() {
                         match self.get_or_create_page() {
                             Some(page) => {

@@ -263,9 +263,17 @@ impl Handler {
                 PendingRequest::ExternalCommand(tx) => {
                     let _ = tx.send(Ok(resp)).ok();
                 }
-                PendingRequest::InternalCommand(target_id) => {
+                PendingRequest::InternalCommand(target_id, session) => {
                     if let Some(target) = self.targets.get_mut(&target_id) {
-                        target.on_response(resp, method.as_ref());
+                        // A command sent on a session the target no longer has
+                        // answers for that old session, not the current
+                        // initialization (screen-play-rs#1041, codex R1).
+                        let stale = session
+                            .as_deref()
+                            .is_some_and(|s| target.session_id().map(|c| c.as_ref()) != Some(s));
+                        if !stale {
+                            target.on_response(resp, method.as_ref());
+                        }
                     }
                 }
                 PendingRequest::CloseBrowser(tx) => {
@@ -298,6 +306,7 @@ impl Handler {
         req: CdpRequest,
         now: Instant,
     ) -> Result<()> {
+        let session = req.session_id.clone();
         let call_id = self.conn.submit_command(
             req.method.clone(),
             req.session_id.map(Into::into),
@@ -305,7 +314,7 @@ impl Handler {
         )?;
         self.pending_commands.insert(
             call_id,
-            (PendingRequest::InternalCommand(target_id), req.method, now),
+            (PendingRequest::InternalCommand(target_id, session), req.method, now),
         );
         Ok(())
     }
@@ -545,8 +554,32 @@ impl Handler {
     /// A new session is attached to a target
     fn on_attached_to_target(&mut self, event: Box<EventAttachedToTarget>) {
         let session = Session::new(event.session_id.clone(), event.target_info.target_id);
+        let mut refuse = false;
         if let Some(target) = self.targets.get_mut(session.target_id()) {
-            target.set_session_id(session.session_id().clone())
+            if target.desired_attached() {
+                target.set_session_id(session.session_id().clone())
+            } else {
+                // Detached on purpose while this attach was in flight
+                // (screen-play-rs#1041, codex R1): end the session it brought
+                // instead of adopting it.
+                target.abandon_attachment();
+                refuse = true;
+            }
+        }
+        if refuse {
+            let params = crate::cdp::browser_protocol::target::DetachFromTargetParams::builder()
+                .session_id(session.session_id().clone())
+                .build();
+            let target_id = session.target_id().clone();
+            let _ = self.submit_internal_command(
+                target_id,
+                CdpRequest {
+                    method: params.identifier(),
+                    session_id: None,
+                    params: serde_json::to_value(params).unwrap(),
+                },
+                Instant::now(),
+            );
         }
         self.sessions.insert(event.session_id, session);
     }
@@ -632,7 +665,7 @@ impl Handler {
                     PendingRequest::ExternalCommand(tx) => {
                         let _ = tx.send(Err(CdpError::Timeout));
                     }
-                    PendingRequest::InternalCommand(_) => {}
+                    PendingRequest::InternalCommand(..) => {}
                     PendingRequest::CloseBrowser(tx) => {
                         let _ = tx.send(Err(CdpError::Timeout));
                     }
@@ -899,7 +932,9 @@ enum PendingRequest {
     ExternalCommand(OneshotSender<Result<Response>>),
     /// Requests that are initiated directly from a `Target` (all the
     /// initialization commands).
-    InternalCommand(TargetId),
+    /// The target, and the session the command was sent on (`None` for a
+    /// browser-level command such as the attach).
+    InternalCommand(TargetId, Option<String>),
     // A Request to close the browser.
     CloseBrowser(OneshotSender<Result<CloseReturns>>),
 }
