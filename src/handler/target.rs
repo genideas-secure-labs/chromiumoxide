@@ -77,9 +77,7 @@ macro_rules! advance_state {
         // No session, no commands — every initialization state, not only the
         // first (screen-play-rs#1041). A lost session is handled by
         // `on_session_lost`, which re-attaches or leaves the target detached.
-        if $s.session_id.is_none() {
-            return None;
-        }
+        $s.session_id.as_ref()?;
         if let Poll::Ready(poll) = $cmds.poll($now) {
             return match poll {
                 None => {
@@ -258,7 +256,30 @@ impl Target {
         if !self.is_page() {
             return;
         }
-        self.begin_reattach(now, false);
+        if !self.begin_reattach(now, false) {
+            // The budget is spent: whatever was initializing will not finish,
+            // so whoever waits hears now instead of never (codex R2).
+            self.give_up_recovery(CdpError::msg(
+                "the target kept losing its session; recovery budget spent",
+            ));
+        }
+    }
+
+    /// Stop recovering: the target stays detached, and whoever waits for its
+    /// page — a `reattach_target`, or the `new_page` whose first
+    /// initialization lost its session — gets `error`.
+    fn give_up_recovery(&mut self, error: CdpError) {
+        if let Some(waiter) = self.reattach_waiter.take() {
+            let _ = waiter.send(Err(CdpError::msg(error.to_string())));
+        }
+        if let Some(initiator) = self.initiator.take() {
+            let _ = initiator.send(Err(error));
+        }
+        self.reattaching = false;
+        self.attach_in_flight = false;
+        self.init_error = None;
+        self.clear_page();
+        self.init_state = TargetInit::Initialized;
     }
 
     /// Discovery named this already-tracked target again (screen-play-rs#1041):
@@ -325,6 +346,15 @@ impl Target {
     /// attached, initialized target answers at once; otherwise the page is
     /// sent to `tx` when the new session finishes initializing.
     pub(crate) fn reattach(&mut self, now: Instant, tx: Sender<Result<Page>>) {
+        if !self.is_page() {
+            // Only pages are attached and polled here; a waiter on anything
+            // else would wait forever (codex R2).
+            let _ = tx.send(Err(CdpError::msg(format!(
+                "reattach_target supports page targets only, not {:?}",
+                self.r#type()
+            ))));
+            return;
+        }
         self.desired_attached = true;
         if self.session_id.is_some() && self.is_initialized() {
             match self.get_or_create_page() {
@@ -510,6 +540,11 @@ impl Target {
                 // churn, not a failed page (codex). The page still works; that
                 // frame simply has no utility world.
                 method != CreateIsolatedWorldParams::IDENTIFIER
+                    // The browser-session detach that ends a failed recovery
+                    // session can be refused too ("session not found"): that
+                    // is the cleanup's answer, not the retry's
+                    // (screen-play-rs#1041, codex R2).
+                    && method != DetachFromTargetParams::IDENTIFIER
             }) {
                 tracing::warn!(
                     target_id = ?self.info.target_id,
@@ -666,19 +701,9 @@ impl Target {
                 // The waiters keep waiting for the retry.
                 return detach_failed;
             }
-            // Giving up: whoever waits — `reattach_target`, or the original
-            // `new_page` whose first initialization lost its session — gets
-            // the error instead of waiting forever (codex R1).
-            if let Some(waiter) = self.reattach_waiter.take() {
-                let _ = waiter.send(Err(CdpError::msg(error.to_string())));
-            }
-            if let Some(initiator) = self.initiator.take() {
-                let _ = initiator.send(Err(error));
-            }
-            self.reattaching = false;
-            self.attach_in_flight = false;
-            self.clear_page();
-            self.init_state = TargetInit::Initialized;
+            // Giving up: whoever waits gets the error instead of waiting
+            // forever (codex R1).
+            self.give_up_recovery(error);
             return detach_failed;
         }
         if let Some(initiator) = self.initiator.take() {
@@ -1701,5 +1726,97 @@ mod session_recovery_tests {
             other => panic!("expected the re-attached page, got {other:?}"),
         }
         assert_eq!(t.session_generation(), 1);
+    }
+
+    #[test]
+    fn a_new_page_that_keeps_losing_its_session_gets_an_error_not_a_hang() {
+        // codex R2 P1: the session is lost again and again during
+        // initialization until the budget is spent — the `new_page` caller
+        // and a waiting `reattach_target` both hear.
+        let mut t = target();
+        let (tx, mut rx) = futures::channel::oneshot::channel();
+        t.initiator = Some(tx);
+        let now = Instant::now();
+        let mut attaches = 0;
+        let mut waiter = None;
+        for i in 0..(RECOVERY_BUDGET + 3) {
+            match cx_poll(&mut t) {
+                Some(TargetEvent::Request(req))
+                    if req.method == AttachToTargetParams::IDENTIFIER =>
+                {
+                    attaches += 1;
+                }
+                _ => break,
+            }
+            t.set_session_id(SessionId::from(format!("S{i}")));
+            if i == 1 {
+                let (wtx, wrx) = futures::channel::oneshot::channel();
+                t.reattach(now, wtx);
+                waiter = Some(wrx);
+            }
+            t.on_session_lost(now);
+        }
+        assert_eq!(attaches, RECOVERY_BUDGET + 1);
+        match rx.try_recv() {
+            Ok(Some(Err(_))) => {}
+            other => panic!("the new_page caller must get an error, got {other:?}"),
+        }
+        match waiter.unwrap().try_recv() {
+            Ok(Some(Err(_))) => {}
+            other => panic!("the reattach_target caller must get an error, got {other:?}"),
+        }
+        assert!(cx_poll(&mut t).is_none(), "nothing more is sent");
+    }
+
+    #[test]
+    fn a_failed_cleanup_detach_does_not_fail_the_retry() {
+        // codex R2 P2: ending a failed session can itself fail ("session not
+        // found") — that answer belongs to the cleanup, not the retry.
+        let mut t = initialized("S1");
+        t.on_session_lost(Instant::now());
+        assert!(matches!(cx_poll(&mut t), Some(TargetEvent::Request(_)))); // attach
+        t.set_session_id(SessionId::from("S2".to_string()));
+        t.on_response(err_reply(), "Page.enable");
+        match cx_poll(&mut t) {
+            Some(TargetEvent::Request(req)) => assert_eq!(req.method, "Target.detachFromTarget"),
+            other => panic!("expected the cleanup detach, got {other:?}"),
+        }
+        match cx_poll(&mut t) {
+            Some(TargetEvent::Request(req)) => {
+                assert_eq!(req.method, AttachToTargetParams::IDENTIFIER)
+            }
+            other => panic!("expected the retry attach, got {other:?}"),
+        }
+        t.set_session_id(SessionId::from("S3".to_string()));
+        t.on_response(err_reply(), "Target.detachFromTarget");
+        let sent = drive(&mut t, "S3");
+        let names = methods(&sent);
+        assert!(
+            !names
+                .iter()
+                .any(|m| m == "Target.detachFromTarget" || m == AttachToTargetParams::IDENTIFIER),
+            "the retry must not fail: {names:?}"
+        );
+        assert!(t.is_initialized());
+        assert_eq!(
+            t.session_id().map(|s| s.as_ref().to_string()),
+            Some("S3".into())
+        );
+    }
+
+    #[test]
+    fn reattach_of_a_non_page_target_is_refused_at_once() {
+        // codex R2 P2: only pages are polled, so a waiter on anything else
+        // would wait forever.
+        let info: TargetInfo = serde_json::from_value(serde_json::json!({
+            "targetId": "W1", "type": "service_worker", "title": "", "url": "https://a/sw.js",
+            "attached": false, "canAccessOpener": false
+        }))
+        .unwrap();
+        let mut t = Target::new(info, TargetConfig::default(), BrowserContext::default());
+        let (tx, mut rx) = futures::channel::oneshot::channel();
+        t.reattach(Instant::now(), tx);
+        assert!(matches!(rx.try_recv(), Ok(Some(Err(_)))));
+        assert!(t.reattach_waiter.is_none());
     }
 }
