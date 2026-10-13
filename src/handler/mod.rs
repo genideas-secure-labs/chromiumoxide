@@ -739,13 +739,24 @@ impl Stream for Handler {
                     }
                     Err(err @ CdpError::InvalidMessage(_, _)) => {
                         if pin.config.ignore_invalid_messages {
-                            tracing::warn!("WS Invalid message: {}", err);
+                            // Never the text, and not serde's message either: it can quote the
+                            // value it rejected. Category and position are enough to diagnose.
+                            if let CdpError::InvalidMessage(text, parse) = &err {
+                                tracing::warn!(
+                                    category = ?parse.classify(),
+                                    line = parse.line(),
+                                    column = parse.column(),
+                                    len = text.len(),
+                                    "WS invalid message"
+                                );
+                            }
                         } else {
                             return Poll::Ready(Some(Err(err)));
                         }
                     }
                     Err(err) => {
-                        tracing::error!("WS Connection error: {:?}", err);
+                        // Display, not Debug: Debug of a wrapped WS message prints its payload.
+                        tracing::error!("WS Connection error: {}", err);
                         return Poll::Ready(Some(Err(err)));
                     }
                 }
