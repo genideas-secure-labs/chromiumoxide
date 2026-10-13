@@ -29,7 +29,8 @@ pub enum CdpError {
     Chrome(#[from] chromiumoxide_types::Error),
     #[error("Received no response from the chromium instance.")]
     NoResponse,
-    #[error("Received unexpected ws message: {0:?}")]
+    // Kind and size only: the payload can carry page content.
+    #[error("Received unexpected ws message: {}", describe_ws_message(.0))]
     UnexpectedWsMessage(Message),
     #[error("{0}")]
     ChannelSendError(#[from] ChannelError),
@@ -152,5 +153,36 @@ impl fmt::Debug for BrowserStderr {
         fmt.debug_tuple("BrowserStderr")
             .field(stderr_debug)
             .finish()
+    }
+}
+
+/// A content-free description of a WebSocket message: its kind and payload size.
+fn describe_ws_message(msg: &Message) -> String {
+    match msg {
+        Message::Text(text) => format!("text, {} bytes", text.len()),
+        Message::Binary(data) => format!("binary, {} bytes", data.len()),
+        Message::Ping(data) => format!("ping, {} bytes", data.len()),
+        Message::Pong(data) => format!("pong, {} bytes", data.len()),
+        Message::Close(_) => "close".to_string(),
+        Message::Frame(frame) => format!("raw frame, {} payload bytes", frame.payload().len()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unexpected_ws_message_display_carries_no_payload() {
+        let sentinel = "page-content-sentinel-7f3a";
+        let cases = [
+            Message::Text(sentinel.into()),
+            Message::Binary(sentinel.as_bytes().to_vec().into()),
+        ];
+        for msg in cases {
+            let shown = CdpError::UnexpectedWsMessage(msg).to_string();
+            assert!(!shown.contains(sentinel), "payload leaked: {shown}");
+            assert!(shown.contains("26 bytes"), "size missing: {shown}");
+        }
     }
 }
