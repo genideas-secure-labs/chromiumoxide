@@ -152,7 +152,17 @@ impl Handler {
         if let Some(nav) = self.navigations.remove(&id) {
             match nav {
                 NavigationRequest::Navigate(mut nav) => {
-                    if nav.navigated {
+                    if resp.error.is_some() {
+                        // The navigation was refused: no page load follows an error answer, so
+                        // it completes now, with that error. It used to be stored while the
+                        // navigation waited for a load that never comes, until the 30 s timeout
+                        // (winclaw#2121, U-3 fix 3). The frame's watcher is dropped too, or the
+                        // page's next navigation would queue behind it until that timeout.
+                        for target in self.targets.values_mut() {
+                            target.frame_manager_mut().abort_navigation(id);
+                        }
+                        let _ = nav.tx.send(Ok(resp));
+                    } else if nav.navigated {
                         let _ = nav.tx.send(Ok(resp));
                     } else {
                         nav.set_response(resp);

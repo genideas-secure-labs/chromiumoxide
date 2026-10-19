@@ -446,3 +446,39 @@ async fn the_handler_ends_when_the_connection_drops() {
         .expect("the handler did not end after the connection dropped")
         .expect("handler task");
 }
+
+/// U-3 fix 3: an error answer to `Page.navigate` completes the navigation at once, with that
+/// error. It used to be stored while the navigation waited for a page load that never comes,
+/// until the 30 s timeout (29.99 s measured on WinClaw's relay). The next navigation on the page
+/// is not held behind the failed one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_error_answer_to_navigate_fails_the_navigation_at_once() {
+    let peer = Peer::start(|s| {
+        s.navigate_error = Some(json!({
+            "code": -32000,
+            "message": "session_ended: the session ended (devtools)",
+            "data": "session_ended",
+        }))
+    })
+    .await;
+    let (_browser, page, _task, _stop) = attach(&peer).await;
+    let start = Instant::now();
+    let got = tokio::time::timeout(PROMPT, page.goto("http://127.0.0.1:9/refused"))
+        .await
+        .unwrap_or_else(|_| panic!("the refused navigation was still waiting after {PROMPT:?}"));
+    let waited = start.elapsed();
+    match got {
+        Err(CdpError::Chrome(err)) => {
+            assert_eq!(err.code, -32000);
+            assert!(err.message.starts_with("session_ended"), "{err}");
+        }
+        other => panic!("expected the peer's error, got {other:?}"),
+    }
+    assert!(waited < Duration::from_secs(1), "{waited:?}");
+
+    peer.state.lock().unwrap().navigate_error = None;
+    tokio::time::timeout(PROMPT, page.goto("http://127.0.0.1:9/next"))
+        .await
+        .expect("the next navigation was held behind the refused one")
+        .expect("the next navigation");
+}
