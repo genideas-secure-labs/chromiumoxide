@@ -10,6 +10,7 @@ use std::task::{Context, Poll};
 
 use crate::cmd::{CommandMessage, to_command_response};
 use crate::error::Result;
+use crate::handler::page_channel_error;
 use crate::handler::target::TargetMessage;
 use chromiumoxide_cdp::cdp::browser_protocol::target::SessionId;
 use chromiumoxide_types::{Command, CommandResponse, MethodId, Response};
@@ -73,10 +74,12 @@ where
 
         if this.message.is_some() {
             match this.target_sender.poll_ready(cx) {
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(page_channel_error(e))),
                 Poll::Ready(Ok(_)) => {
                     let message = this.message.take().expect("existence checked above");
-                    this.target_sender.start_send(message)?;
+                    this.target_sender
+                        .start_send(message)
+                        .map_err(page_channel_error)?;
 
                     cx.waker().wake_by_ref();
                     Poll::Pending
@@ -91,7 +94,7 @@ where
                     Poll::Ready(to_command_response::<T>(response, this.method.clone()))
                 }
                 Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(page_channel_error(e))),
                 Poll::Pending => Poll::Pending,
             }
         }

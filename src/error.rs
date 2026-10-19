@@ -79,6 +79,11 @@ pub enum ChannelError {
     Send(#[from] SendError),
     #[error("{0}")]
     Canceled(#[from] Canceled),
+    /// A call on a [`Page`](crate::page::Page) whose handle is closed: its target ended, its
+    /// session detached, or the handler stopped. Its page channel is gone, so the call never
+    /// reached a target, or was dropped before it was answered.
+    #[error("page closed: its target ended, its session detached, or the handler stopped")]
+    PageClosed,
 }
 
 impl From<Canceled> for CdpError {

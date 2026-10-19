@@ -54,7 +54,7 @@ macro_rules! advance_state {
                     session_id: $s.session_id.clone().map(Into::into),
                     params,
                 })),
-                Some(Err(_)) => Some($s.on_initialization_failed()),
+                Some(Err(_)) => $s.initialization_failed($cx, $now),
             };
         } else {
             return None;
@@ -92,6 +92,9 @@ pub struct Target {
     wait_for_frame_navigation: Vec<Sender<ArcHttpRequest>>,
     /// The sender who requested the page.
     initiator: Option<Sender<Result<Page>>>,
+    /// An `iframe` target auto-attached under another target's session (an out-of-process
+    /// frame), bound to the session it came with ([`Target::new_child`]).
+    child: bool,
 }
 
 impl Target {
@@ -120,7 +123,36 @@ impl Target {
             event_listeners: Default::default(),
             initiator: None,
             browser_context,
+            child: false,
         }
+    }
+
+    /// A target auto-attached under another target's session: an `iframe` (an out-of-process
+    /// frame). It is already attached, on `session`, so it starts at the root's first
+    /// initialisation step and runs the same chain on its own session — its frame tracking,
+    /// isolated world, network events and automatic attachment, so its events flow and a frame
+    /// nested in it attaches too (winclaw#2121, U-3 fix 4). `config` is the caller's: the handler
+    /// gives a child no viewport (that is the page's) and no request interception (a request
+    /// paused on a child session would reach no listener of the page's).
+    pub(crate) fn new_child(
+        info: TargetInfo,
+        config: TargetConfig,
+        browser_context: BrowserContext,
+        session: SessionId,
+    ) -> Self {
+        let mut target = Self::new(info, config, browser_context);
+        target.init_state = TargetInit::InitializingFrame(FrameManager::init_commands(
+            target.config.request_timeout,
+            target.config.stealth_mode,
+        ));
+        target.session_id = Some(session);
+        target.child = true;
+        target
+    }
+
+    /// Whether this target is an auto-attached child ([`Target::new_child`]).
+    pub fn is_child(&self) -> bool {
+        self.child
     }
 
     pub fn set_session_id(&mut self, id: SessionId) {
@@ -236,6 +268,11 @@ impl Target {
 
     /// Tries to create the `PageInner` if this target is already initialized
     pub(crate) fn get_or_create_page(&mut self) -> Option<&Arc<PageInner>> {
+        if self.child && matches!(self.init_state, TargetInit::Closing) {
+            // A child whose initialisation failed gives no new handle: `Browser::get_page` ends
+            // with `NotFound` (review F5).
+            return None;
+        }
         self.create_page();
         self.page.as_ref().map(|p| p.inner())
     }
@@ -370,23 +407,38 @@ impl Target {
     }
 
     /// Called when a init command timed out
-    fn on_initialization_failed(&mut self) -> TargetEvent {
+    fn on_initialization_failed(&mut self) -> Option<TargetEvent> {
         if let Some(initiator) = self.initiator.take() {
             let _ = initiator.send(Err(CdpError::Timeout));
         }
         self.init_state = TargetInit::Closing;
+        if self.child {
+            // A frame is not this crate's to close: `Target.closeTarget` names a tab, and a peer
+            // that lends one tab ends its whole attachment on it.
+            return None;
+        }
         let close_target = CloseTargetParams::new(self.info.target_id.clone());
-        TargetEvent::Request(Request {
+        Some(TargetEvent::Request(Request {
             method: close_target.identifier(),
             session_id: self.session_id.clone().map(Into::into),
             params: serde_json::to_value(close_target).unwrap(),
-        })
+        }))
+    }
+
+    /// An init command timed out: a page closes itself; a child goes on polling as `Closing`, in
+    /// this same pass, so what it queued (a nested frame's resume) is sent now rather than at the
+    /// next wake-up, which may never come (review F5).
+    fn initialization_failed(&mut self, cx: &mut Context<'_>, now: Instant) -> Option<TargetEvent> {
+        match self.on_initialization_failed() {
+            Some(close) => Some(close),
+            None => self.poll(cx, now),
+        }
     }
 
     /// Advance that target's state
     pub(crate) fn poll(&mut self, cx: &mut Context<'_>, now: Instant) -> Option<TargetEvent> {
-        if !self.is_page() {
-            // can only poll pages
+        if !self.is_page() && !self.child {
+            // can only poll pages, and the frames auto-attached under them
             return None;
         }
         match &mut self.init_state {
@@ -440,7 +492,7 @@ impl Target {
                             session_id: self.session_id.clone().map(Into::into),
                             params,
                         })),
-                        Some(Err(_)) => Some(self.on_initialization_failed()),
+                        Some(Err(_)) => self.initialization_failed(cx, now),
                     };
                 } else {
                     return None;
@@ -494,6 +546,11 @@ impl Target {
                     }
                 }
             }
+            // A page that gave up closes itself (`on_initialization_failed`). A child whose
+            // initialisation timed out does not, and is still attached: it keeps relaying, so the
+            // resume it queued for a frame nested in it is sent and that frame does not stay
+            // paused (review F5), and what its page channel holds is answered.
+            TargetInit::Closing if self.child => {}
             TargetInit::Closing => return None,
         };
         loop {

@@ -341,6 +341,20 @@ impl FrameManager {
         None
     }
 
+    /// Stop watching navigation `id`: its `Page.navigate` was answered with an error, so no page
+    /// load will complete it, and the handler has already completed it with that error. The
+    /// watcher is the one ongoing navigation once its request was sent, so dropping it lets the
+    /// next queued navigation start now instead of after the watcher's deadline.
+    pub(crate) fn abort_navigation(&mut self, id: NavigationId) {
+        if self
+            .navigation
+            .as_ref()
+            .is_some_and(|(watcher, _)| watcher.id == id)
+        {
+            self.navigation = None;
+        }
+    }
+
     /// Entrypoint for page navigation
     pub fn goto(&mut self, req: FrameNavigationRequest) {
         if let Some(frame_id) = self.main_frame.clone() {

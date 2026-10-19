@@ -15,7 +15,7 @@ use chromiumoxide_cdp::cdp::events::CdpEvent;
 use chromiumoxide_cdp::cdp::events::CdpEventMessage;
 use chromiumoxide_types::{CallId, Message, Method, Response};
 use chromiumoxide_types::{MethodId, Request as CdpRequest};
-pub(crate) use page::PageInner;
+pub(crate) use page::{PageInner, page_channel_error};
 
 use crate::cmd::{CommandMessage, to_command_response};
 use crate::conn::Connection;
@@ -47,6 +47,9 @@ mod session;
 pub mod target;
 pub mod target_message_future;
 pub mod viewport;
+
+#[cfg(test)]
+mod scripted_peer_tests;
 
 /// The handler that monitors the state of the chromium browser and drives all
 /// the requests and events.
@@ -149,7 +152,17 @@ impl Handler {
         if let Some(nav) = self.navigations.remove(&id) {
             match nav {
                 NavigationRequest::Navigate(mut nav) => {
-                    if nav.navigated {
+                    if resp.error.is_some() {
+                        // The navigation was refused: no page load follows an error answer, so
+                        // it completes now, with that error. It used to be stored while the
+                        // navigation waited for a load that never comes, until the 30 s timeout
+                        // (winclaw#2121, U-3 fix 3). The frame's watcher is dropped too, or the
+                        // page's next navigation would queue behind it until that timeout.
+                        for target in self.targets.values_mut() {
+                            target.frame_manager_mut().abort_navigation(id);
+                        }
+                        let _ = nav.tx.send(Ok(resp));
+                    } else if nav.navigated {
                         let _ = nav.tx.send(Ok(resp));
                     } else {
                         nav.set_response(resp);
@@ -420,7 +433,23 @@ impl Handler {
         if let Some(ref session_id) = event.session_id {
             if let Some(session) = self.sessions.get(session_id.as_str()) {
                 if let Some(target) = self.targets.get_mut(session.target_id()) {
-                    return target.on_event(event);
+                    // A target's automatic attachment reports its children on its own session.
+                    let child = match &event.params {
+                        CdpEvent::TargetAttachedToTarget(ev)
+                            if ev.target_info.r#type == "iframe" =>
+                        {
+                            Some(Ok((**ev).clone()))
+                        }
+                        CdpEvent::TargetDetachedFromTarget(ev) => Some(Err(ev.session_id.clone())),
+                        _ => None,
+                    };
+                    target.on_event(event);
+                    match child {
+                        Some(Ok(attached)) => self.on_child_attached(attached),
+                        Some(Err(detached)) => self.on_child_detached(&detached),
+                        None => {}
+                    }
+                    return;
                 }
             }
         }
@@ -540,6 +569,89 @@ impl Handler {
             target.set_session_id(session.session_id().clone())
         }
         self.sessions.insert(event.session_id, session);
+    }
+
+    /// An `iframe` target was auto-attached under a tracked target's session: an out-of-process
+    /// frame. It is tracked as a target of its own, bound to the session it came with and
+    /// initialised like the root, so its events reach it and a frame nested in it attaches too.
+    /// It used to be sent `Runtime.runIfWaitingForDebugger` (by its parent, which still does)
+    /// and nothing else: no domain enabled, so no event ever came from it, and no automatic
+    /// attachment, so a frame nested in it never attached (winclaw#2121, U-3 fix 4).
+    ///
+    /// Not a page: `Browser::pages` still lists pages only. `Browser::get_page` with its id gives
+    /// a handle on its own session.
+    ///
+    /// Not in stealth mode: there a child is left as before, with no domain enabled.
+    fn on_child_attached(&mut self, event: EventAttachedToTarget) {
+        // Stealth keeps the old behaviour: no domain is enabled on a child. The out-of-process
+        // frames are exactly where captcha and anti-bot scripts run, and `Runtime.enable` there
+        // is the fingerprint stealth exists to avoid (review F1). Stealth also attaches children
+        // without pausing them (`waitForDebuggerOnStart: false`), so none waits to be resumed.
+        if self.config.stealth_mode {
+            return;
+        }
+        let target_id = event.target_info.target_id.clone();
+        // A repeated attachment on the same session changes nothing. Anything else tracked under
+        // this id — the same frame on a new session, or a target discovery reported and nobody
+        // polls — is replaced, so the child starts from a clean state on its current session.
+        if let Some(existing) = self.targets.get(&target_id) {
+            if existing.is_child() && existing.session_id() == Some(&event.session_id) {
+                return;
+            }
+            if let Some(old) = existing.session_id().cloned() {
+                self.sessions.remove(&old);
+            }
+        }
+        let browser_ctx = event
+            .target_info
+            .browser_context_id
+            .clone()
+            .map(BrowserContext::from)
+            .filter(|id| self.browser_contexts.contains(id))
+            .unwrap_or_else(|| self.default_browser_context.clone());
+        let target = Target::new_child(
+            event.target_info,
+            TargetConfig {
+                ignore_https_errors: self.config.ignore_https_errors,
+                request_timeout: self.config.request_timeout,
+                // The viewport is the page's.
+                viewport: None,
+                // A request paused on the child's session would reach no listener of the page's.
+                request_intercept: false,
+                cache_enabled: self.config.cache_enabled,
+                stealth_mode: self.config.stealth_mode,
+            },
+            browser_ctx,
+            event.session_id.clone(),
+        );
+        if !self.target_ids.contains(&target_id) {
+            self.target_ids.push(target_id.clone());
+        }
+        self.targets.insert(target_id.clone(), target);
+        self.sessions.insert(
+            event.session_id.clone(),
+            Session::new(event.session_id, target_id),
+        );
+    }
+
+    /// A session was detached, reported on its parent's session. If it is an auto-attached
+    /// child's, the child is gone: its session and its target are dropped (a new attachment
+    /// brings it back). Any other session is left to `on_detached_from_target`'s browser-level
+    /// path, as before.
+    fn on_child_detached(&mut self, session_id: &SessionId) {
+        let child = self
+            .sessions
+            .get(session_id)
+            .map(|session| session.target_id().clone())
+            .filter(|id| {
+                self.targets
+                    .get(id)
+                    .is_some_and(|t| t.is_child() && t.session_id() == Some(session_id))
+            });
+        if let Some(target_id) = child {
+            self.sessions.remove(session_id);
+            self.targets.remove(&target_id);
+        }
     }
 
     /// The session was detached from target.
@@ -715,8 +827,6 @@ impl Stream for Handler {
 
                     // poll the target's event listeners
                     target.event_listeners_mut().poll(cx);
-                    // poll the handler's event listeners
-                    pin.event_listeners_mut().poll(cx);
 
                     pin.targets.insert(id, target);
                     pin.target_ids.push(target_id);
@@ -725,7 +835,23 @@ impl Stream for Handler {
 
             let mut done = true;
 
-            while let Poll::Ready(Some(ev)) = Pin::new(&mut pin.conn).poll_next(cx) {
+            loop {
+                let ev = match Pin::new(&mut pin.conn).poll_next(cx) {
+                    Poll::Ready(Some(ev)) => ev,
+                    // The connection ended (the peer closed the socket, or it dropped after an
+                    // error item). Nothing can arrive or be sent any more, so the handler ends
+                    // too: a caller's `while let Some(_) = handler.next().await` returns, and
+                    // dropping the handler fails every pending call. This used to read as
+                    // "nothing read": the handler returned `Pending` and never ended — its
+                    // eviction timer still woke it, but nothing could end it (winclaw#2121, U-3
+                    // fix 2).
+                    Poll::Ready(None) => {
+                        // Deliver what was read before the end, e.g. a page's ending events.
+                        pin.event_listeners_mut().poll(cx);
+                        return Poll::Ready(None);
+                    }
+                    Poll::Pending => break,
+                };
                 match ev {
                     Ok(Message::Response(resp)) => {
                         pin.on_response(resp);
@@ -762,6 +888,14 @@ impl Stream for Handler {
                 }
                 done = false;
             }
+
+            // Poll the handler's own event listeners once per pass, whether or not any target
+            // exists. They used to be polled only inside the per-target loop above, so an event
+            // that arrived when no target was left — the ending of a session's last page, whose
+            // `Target.targetDestroyed` removes that very target — was queued and never delivered
+            // (winclaw#2121, U-3 fix 1). Polled after the read, so what was read this pass is
+            // delivered this pass.
+            pin.event_listeners_mut().poll(cx);
 
             if pin.evict_command_timeout.poll_ready(cx) {
                 // evict all commands that timed out
