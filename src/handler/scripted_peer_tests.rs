@@ -53,6 +53,8 @@ struct PeerState {
     frames: HashMap<String, String>,
     /// Navigations answered so far, for fresh loader ids.
     navigations: usize,
+    /// Whether the children it attaches wait for the debugger (`false` is what stealth asks for).
+    children_run_at_once: bool,
 }
 
 enum Control {
@@ -213,6 +215,7 @@ fn answer(state: &Mutex<PeerState>, call: Value) -> Vec<Value> {
     let id = call["id"].clone();
     let session = call["sessionId"].as_str().map(str::to_owned);
     let session = session.as_deref();
+    let waiting = !state.children_run_at_once;
     let result = |result: Value| tagged(json!({ "id": id, "result": result }), session);
     match call["method"].as_str().unwrap_or_default() {
         "Target.getTargets" => vec![result(
@@ -281,7 +284,7 @@ fn answer(state: &Mutex<PeerState>, call: Value) -> Vec<Value> {
                         "params": {
                             "sessionId": child_session,
                             "targetInfo": target_info(&child_target, "iframe", true),
-                            "waitingForDebugger": true,
+                            "waitingForDebugger": waiting,
                         },
                     }),
                     session,
@@ -319,7 +322,15 @@ fn config() -> HandlerConfig {
 
 /// Connect to `peer` and adopt its one page, the way a caller adopts a page it did not create.
 async fn attach(peer: &Peer) -> (Browser, Page, JoinHandle<Handler>, oneshot::Sender<()>) {
-    let (mut browser, handler) = Browser::connect_with_config(peer.url.clone(), config())
+    attach_with(peer, config()).await
+}
+
+/// [`attach`] with a handler configuration of the test's own.
+async fn attach_with(
+    peer: &Peer,
+    config: HandlerConfig,
+) -> (Browser, Page, JoinHandle<Handler>, oneshot::Sender<()>) {
+    let (mut browser, handler) = Browser::connect_with_config(peer.url.clone(), config)
         .await
         .expect("connect");
     let (task, stop) = run_handler(handler);
@@ -606,5 +617,58 @@ async fn an_auto_attached_child_is_initialised_like_the_root() {
     assert_eq!(
         nested.frame_manager().main_frame().map(|f| f.id().as_ref()),
         Some(NESTED_FRAME)
+    );
+}
+
+/// Review F1 (chromiumoxide#7): in stealth mode an auto-attached child is left as before fix 4,
+/// with no domain enabled. Out-of-process frames are where captcha and anti-bot scripts run, and
+/// `Runtime.enable` there is the fingerprint stealth exists to avoid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stealth_mode_leaves_an_auto_attached_child_uninitialised() {
+    const CHILD_SESSION: &str = "CHILD-SESSION-1";
+    const CHILD_TARGET: &str = "CHILD-TARGET-1";
+    let peer = Peer::start(|s| {
+        s.children_run_at_once = true;
+        s.children.insert(
+            PAGE_SESSION.to_string(),
+            vec![(
+                CHILD_SESSION.into(),
+                CHILD_TARGET.into(),
+                "CHILD-FRAME-1".into(),
+            )],
+        );
+    })
+    .await;
+    let stealth = HandlerConfig {
+        stealth_mode: true,
+        ..config()
+    };
+    let (browser, page, _task, _stop) = attach_with(&peer, stealth).await;
+    peer.wait_call("Target.setAutoAttach", Some(PAGE_SESSION))
+        .await;
+    // A round trip after the child's attachment: by the time its answer is read, the handler has
+    // read the attachment and polled its targets, so a child it tracked has sent its first call.
+    page.execute(GetFrameTreeParams::default())
+        .await
+        .expect("a round trip");
+    let child_calls = peer
+        .state
+        .lock()
+        .unwrap()
+        .calls
+        .iter()
+        .filter(|c| c["sessionId"] == CHILD_SESSION)
+        .map(|c| c["method"].as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        child_calls.is_empty(),
+        "stealth sent the child {child_calls:?}"
+    );
+    assert!(
+        browser
+            .get_page(TargetId::from(CHILD_TARGET.to_string()))
+            .await
+            .is_err(),
+        "stealth tracked the child"
     );
 }

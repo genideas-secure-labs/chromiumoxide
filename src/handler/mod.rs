@@ -580,7 +580,16 @@ impl Handler {
     ///
     /// Not a page: `Browser::pages` still lists pages only. `Browser::get_page` with its id gives
     /// a handle on its own session.
+    ///
+    /// Not in stealth mode: there a child is left as before, with no domain enabled.
     fn on_child_attached(&mut self, event: EventAttachedToTarget) {
+        // Stealth keeps the old behaviour: no domain is enabled on a child. The out-of-process
+        // frames are exactly where captcha and anti-bot scripts run, and `Runtime.enable` there
+        // is the fingerprint stealth exists to avoid (review F1). Stealth also attaches children
+        // without pausing them (`waitForDebuggerOnStart: false`), so none waits to be resumed.
+        if self.config.stealth_mode {
+            return;
+        }
         let target_id = event.target_info.target_id.clone();
         // A repeated attachment on the same session changes nothing. Anything else tracked under
         // this id — the same frame on a new session, or a target discovery reported and nobody
