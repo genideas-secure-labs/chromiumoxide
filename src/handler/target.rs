@@ -54,7 +54,7 @@ macro_rules! advance_state {
                     session_id: $s.session_id.clone().map(Into::into),
                     params,
                 })),
-                Some(Err(_)) => $s.on_initialization_failed(),
+                Some(Err(_)) => $s.initialization_failed($cx, $now),
             };
         } else {
             return None;
@@ -268,6 +268,11 @@ impl Target {
 
     /// Tries to create the `PageInner` if this target is already initialized
     pub(crate) fn get_or_create_page(&mut self) -> Option<&Arc<PageInner>> {
+        if self.child && matches!(self.init_state, TargetInit::Closing) {
+            // A child whose initialisation failed gives no new handle: `Browser::get_page` ends
+            // with `NotFound` (review F5).
+            return None;
+        }
         self.create_page();
         self.page.as_ref().map(|p| p.inner())
     }
@@ -420,6 +425,16 @@ impl Target {
         }))
     }
 
+    /// An init command timed out: a page closes itself; a child goes on polling as `Closing`, in
+    /// this same pass, so what it queued (a nested frame's resume) is sent now rather than at the
+    /// next wake-up, which may never come (review F5).
+    fn initialization_failed(&mut self, cx: &mut Context<'_>, now: Instant) -> Option<TargetEvent> {
+        match self.on_initialization_failed() {
+            Some(close) => Some(close),
+            None => self.poll(cx, now),
+        }
+    }
+
     /// Advance that target's state
     pub(crate) fn poll(&mut self, cx: &mut Context<'_>, now: Instant) -> Option<TargetEvent> {
         if !self.is_page() && !self.child {
@@ -477,7 +492,7 @@ impl Target {
                             session_id: self.session_id.clone().map(Into::into),
                             params,
                         })),
-                        Some(Err(_)) => self.on_initialization_failed(),
+                        Some(Err(_)) => self.initialization_failed(cx, now),
                     };
                 } else {
                     return None;
@@ -531,6 +546,11 @@ impl Target {
                     }
                 }
             }
+            // A page that gave up closes itself (`on_initialization_failed`). A child whose
+            // initialisation timed out does not, and is still attached: it keeps relaying, so the
+            // resume it queued for a frame nested in it is sent and that frame does not stay
+            // paused (review F5), and what its page channel holds is answered.
+            TargetInit::Closing if self.child => {}
             TargetInit::Closing => return None,
         };
         loop {

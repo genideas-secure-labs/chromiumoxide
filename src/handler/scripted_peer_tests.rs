@@ -53,6 +53,8 @@ struct PeerState {
     frames: HashMap<String, String>,
     /// Navigations answered so far, for fresh loader ids.
     navigations: usize,
+    /// Calls the peer records and never answers: (method, session).
+    withheld: Vec<(String, String)>,
     /// Whether the children it attaches wait for the debugger (`false` is what stealth asks for).
     children_run_at_once: bool,
 }
@@ -215,6 +217,14 @@ fn answer(state: &Mutex<PeerState>, call: Value) -> Vec<Value> {
     let id = call["id"].clone();
     let session = call["sessionId"].as_str().map(str::to_owned);
     let session = session.as_deref();
+    let method = call["method"].as_str().unwrap_or_default();
+    if state
+        .withheld
+        .iter()
+        .any(|(m, s)| m == method && Some(s.as_str()) == session)
+    {
+        return Vec::new();
+    }
     let waiting = !state.children_run_at_once;
     let result = |result: Value| tagged(json!({ "id": id, "result": result }), session);
     match call["method"].as_str().unwrap_or_default() {
@@ -670,5 +680,98 @@ async fn stealth_mode_leaves_an_auto_attached_child_uninitialised() {
             .await
             .is_err(),
         "stealth tracked the child"
+    );
+}
+
+/// Review F5 (chromiumoxide#7): a child whose initialisation times out still resumes the frame
+/// nested in it, and gives no page handle. Before, its `Closing` state returned before draining
+/// its queue, so the nested frame stayed paused for good, and a page handle for it took calls
+/// that nothing would ever answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_whose_initialisation_times_out_resumes_its_nested_frame_and_gives_no_page() {
+    const CHILD_SESSION: &str = "CHILD-SESSION-1";
+    const CHILD_TARGET: &str = "CHILD-TARGET-1";
+    const NESTED_SESSION: &str = "NESTED-SESSION-1";
+    let peer = Peer::start(|s| {
+        s.children.insert(
+            PAGE_SESSION.to_string(),
+            vec![(
+                CHILD_SESSION.into(),
+                CHILD_TARGET.into(),
+                "CHILD-FRAME-1".into(),
+            )],
+        );
+        s.children.insert(
+            CHILD_SESSION.to_string(),
+            vec![(
+                NESTED_SESSION.into(),
+                "NESTED-TARGET-1".into(),
+                "NESTED-FRAME-1".into(),
+            )],
+        );
+        // After the child's `Target.setAutoAttach`, so its nested frame attaches, paused, while
+        // the child's initialisation still waits — and then times out.
+        s.withheld
+            .push(("Performance.enable".into(), CHILD_SESSION.into()));
+    })
+    .await;
+    let short = HandlerConfig {
+        request_timeout: Duration::from_secs(1),
+        ..config()
+    };
+    let (browser, _page, _task, _stop) = attach_with(&peer, short).await;
+    peer.wait_call("Performance.enable", Some(CHILD_SESSION))
+        .await;
+    peer.wait_call("Runtime.runIfWaitingForDebugger", Some(NESTED_SESSION))
+        .await;
+    let got = tokio::time::timeout(
+        PROMPT,
+        browser.get_page(TargetId::from(CHILD_TARGET.to_string())),
+    )
+    .await
+    .expect("get_page on the timed-out child did not end");
+    assert!(
+        matches!(got, Err(CdpError::NotFound)),
+        "a timed-out child gave a page handle: {:?}",
+        got.map(|p| p.target_id().clone())
+    );
+    assert!(
+        peer.calls("Target.closeTarget", Some(PAGE_SESSION))
+            .is_empty()
+    );
+    assert!(peer.calls("Target.closeTarget", None).is_empty());
+}
+
+/// Review F5, the timer under it: the handler's eviction timer re-arms with a waker, so a command
+/// that times out on a quiet connection is evicted and its caller gets `Timeout`. It used to re-arm
+/// without one, so the next eviction ran only if something else woke the handler.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_command_unanswered_on_a_quiet_connection_times_out() {
+    let peer = Peer::start(|s| {
+        s.withheld
+            .push(("Runtime.evaluate".into(), PAGE_SESSION.into()));
+    })
+    .await;
+    let short = HandlerConfig {
+        request_timeout: Duration::from_secs(1),
+        ..config()
+    };
+    let (_browser, page, _task, _stop) = attach_with(&peer, short).await;
+    let start = Instant::now();
+    let got = tokio::time::timeout(
+        PROMPT,
+        page.execute(chromiumoxide_cdp::cdp::js_protocol::runtime::EvaluateParams::new("1")),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("the unanswered command was still waiting after {PROMPT:?}"));
+    assert!(
+        matches!(got, Err(CdpError::Timeout)),
+        "{:?}",
+        got.map(|r| r.result)
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        start.elapsed()
     );
 }
