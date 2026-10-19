@@ -28,7 +28,7 @@ use chromiumoxide_cdp::cdp::js_protocol::runtime::{
 use chromiumoxide_types::{Command, CommandResponse};
 
 use crate::cmd::{CommandMessage, to_command_response};
-use crate::error::{CdpError, Result};
+use crate::error::{CdpError, ChannelError, Result};
 use crate::handler::commandfuture::CommandFuture;
 use crate::handler::domworld::DOMWorldKind;
 use crate::handler::httpfuture::HttpFuture;
@@ -381,8 +381,9 @@ impl PageInner {
                 frame_id,
                 tx,
             }))
-            .await?;
-        Ok(rx.await?)
+            .await
+            .map_err(page_channel_error)?;
+        rx.await.map_err(page_channel_error)
     }
 
     /// Returns metrics relating to the layout of the page
@@ -459,7 +460,27 @@ pub(crate) async fn execute<T: Command>(
     let method = cmd.identifier();
     let msg = CommandMessage::with_session(cmd, tx, session)?;
 
-    sender.send(TargetMessage::Command(msg)).await?;
-    let resp = rx.await??;
+    sender
+        .send(TargetMessage::Command(msg))
+        .await
+        .map_err(page_channel_error)?;
+    let resp = rx.await.map_err(page_channel_error)??;
     to_command_response::<T>(resp, method)
+}
+
+/// The error for a call whose page channel failed (winclaw#2121, U-3 fix 1).
+///
+/// The channel is a page's only way to its target, and it fails only when its receiver is gone:
+/// the target's handle was dropped (the target ended, or its session detached) or the handler
+/// stopped. The call then never reached a target (a failed send) or was dropped unanswered (a
+/// canceled reply). Either way the page is closed, so the caller gets the typed
+/// [`ChannelError::PageClosed`] instead of the channel's own `send failed because receiver is
+/// gone`. It stays a [`CdpError::ChannelSendError`], so code that treats any channel failure as
+/// "this page handle is dead" sees no change. A full channel (only `try_send` reports one) passes
+/// through unchanged.
+pub(crate) fn page_channel_error(err: impl Into<ChannelError>) -> CdpError {
+    match err.into() {
+        ChannelError::Send(err) if !err.is_disconnected() => ChannelError::Send(err).into(),
+        _ => ChannelError::PageClosed.into(),
+    }
 }

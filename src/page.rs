@@ -29,11 +29,11 @@ use chromiumoxide_types::*;
 use crate::auth::Credentials;
 use crate::element::Element;
 use crate::error::{CdpError, Result};
-use crate::handler::PageInner;
 use crate::handler::commandfuture::CommandFuture;
 use crate::handler::domworld::DOMWorldKind;
 use crate::handler::httpfuture::HttpFuture;
 use crate::handler::target::{GetName, GetParent, GetUrl, TargetMessage};
+use crate::handler::{PageInner, page_channel_error};
 use crate::js::{Evaluation, EvaluationResult};
 use crate::layout::Point;
 use crate::listeners::{EventListenerRequest, EventStream};
@@ -318,7 +318,8 @@ impl Page {
             .send(TargetMessage::AddEventListener(
                 EventListenerRequest::new::<T>(tx),
             ))
-            .await?;
+            .await
+            .map_err(page_channel_error)?;
 
         Ok(EventStream::new(rx))
     }
@@ -395,8 +396,9 @@ impl Page {
                 frame_id: Some(frame_id),
                 tx,
             }))
-            .await?;
-        Ok(rx.await?)
+            .await
+            .map_err(page_channel_error)?;
+        rx.await.map_err(page_channel_error)
     }
 
     pub async fn authenticate(&self, credentials: Credentials) -> Result<()> {
@@ -404,7 +406,8 @@ impl Page {
             .sender()
             .clone()
             .send(TargetMessage::Authenticate(credentials))
-            .await?;
+            .await
+            .map_err(page_channel_error)?;
 
         Ok(())
     }
@@ -416,8 +419,9 @@ impl Page {
             .sender()
             .clone()
             .send(TargetMessage::Url(GetUrl::new(tx)))
-            .await?;
-        Ok(rx.await?)
+            .await
+            .map_err(page_channel_error)?;
+        rx.await.map_err(page_channel_error)
     }
 
     /// Returns the current url of the frame
@@ -430,8 +434,9 @@ impl Page {
                 frame_id: Some(frame_id),
                 tx,
             }))
-            .await?;
-        Ok(rx.await?)
+            .await
+            .map_err(page_channel_error)?;
+        rx.await.map_err(page_channel_error)
     }
 
     /// Returns the parent id of the frame
@@ -441,8 +446,9 @@ impl Page {
             .sender()
             .clone()
             .send(TargetMessage::Parent(GetParent { frame_id, tx }))
-            .await?;
-        Ok(rx.await?)
+            .await
+            .map_err(page_channel_error)?;
+        rx.await.map_err(page_channel_error)
     }
 
     /// Return the main frame of the page
@@ -452,8 +458,9 @@ impl Page {
             .sender()
             .clone()
             .send(TargetMessage::MainFrame(tx))
-            .await?;
-        Ok(rx.await?)
+            .await
+            .map_err(page_channel_error)?;
+        rx.await.map_err(page_channel_error)
     }
 
     /// Return the frames of the page
@@ -463,8 +470,9 @@ impl Page {
             .sender()
             .clone()
             .send(TargetMessage::AllFrames(tx))
-            .await?;
-        Ok(rx.await?)
+            .await
+            .map_err(page_channel_error)?;
+        rx.await.map_err(page_channel_error)
     }
 
     /// Allows overriding user agent with the given string.

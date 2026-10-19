@@ -15,7 +15,7 @@ use chromiumoxide_cdp::cdp::events::CdpEvent;
 use chromiumoxide_cdp::cdp::events::CdpEventMessage;
 use chromiumoxide_types::{CallId, Message, Method, Response};
 use chromiumoxide_types::{MethodId, Request as CdpRequest};
-pub(crate) use page::PageInner;
+pub(crate) use page::{PageInner, page_channel_error};
 
 use crate::cmd::{CommandMessage, to_command_response};
 use crate::conn::Connection;
@@ -47,6 +47,9 @@ mod session;
 pub mod target;
 pub mod target_message_future;
 pub mod viewport;
+
+#[cfg(test)]
+mod scripted_peer_tests;
 
 /// The handler that monitors the state of the chromium browser and drives all
 /// the requests and events.
@@ -715,8 +718,6 @@ impl Stream for Handler {
 
                     // poll the target's event listeners
                     target.event_listeners_mut().poll(cx);
-                    // poll the handler's event listeners
-                    pin.event_listeners_mut().poll(cx);
 
                     pin.targets.insert(id, target);
                     pin.target_ids.push(target_id);
@@ -725,7 +726,23 @@ impl Stream for Handler {
 
             let mut done = true;
 
-            while let Poll::Ready(Some(ev)) = Pin::new(&mut pin.conn).poll_next(cx) {
+            loop {
+                let ev = match Pin::new(&mut pin.conn).poll_next(cx) {
+                    Poll::Ready(Some(ev)) => ev,
+                    // The connection ended (the peer closed the socket, or it dropped after an
+                    // error item). Nothing can arrive or be sent any more, so the handler ends
+                    // too: a caller's `while let Some(_) = handler.next().await` returns, and
+                    // dropping the handler fails every pending call. This used to read as
+                    // "nothing read": the handler returned `Pending` and never ended — its
+                    // eviction timer still woke it, but nothing could end it (winclaw#2121, U-3
+                    // fix 2).
+                    Poll::Ready(None) => {
+                        // Deliver what was read before the end, e.g. a page's ending events.
+                        pin.event_listeners_mut().poll(cx);
+                        return Poll::Ready(None);
+                    }
+                    Poll::Pending => break,
+                };
                 match ev {
                     Ok(Message::Response(resp)) => {
                         pin.on_response(resp);
@@ -762,6 +779,14 @@ impl Stream for Handler {
                 }
                 done = false;
             }
+
+            // Poll the handler's own event listeners once per pass, whether or not any target
+            // exists. They used to be polled only inside the per-target loop above, so an event
+            // that arrived when no target was left — the ending of a session's last page, whose
+            // `Target.targetDestroyed` removes that very target — was queued and never delivered
+            // (winclaw#2121, U-3 fix 1). Polled after the read, so what was read this pass is
+            // delivered this pass.
+            pin.event_listeners_mut().poll(cx);
 
             if pin.evict_command_timeout.poll_ready(cx) {
                 // evict all commands that timed out
