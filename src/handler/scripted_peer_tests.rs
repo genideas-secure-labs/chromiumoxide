@@ -150,6 +150,28 @@ impl Peer {
             .cloned()
             .collect()
     }
+
+    /// Wait, up to [`PROMPT`], for a call to `method` on `session`.
+    async fn wait_call(&self, method: &str, session: Option<&str>) -> Value {
+        let start = Instant::now();
+        loop {
+            if let Some(call) = self.calls(method, session).into_iter().next() {
+                return call;
+            }
+            assert!(
+                start.elapsed() < PROMPT,
+                "no {method} on session {session:?} within {PROMPT:?}; calls: {:?}",
+                self.state
+                    .lock()
+                    .unwrap()
+                    .calls
+                    .iter()
+                    .map(|c| format!("{}@{}", c["method"], c["sessionId"]))
+                    .collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 }
 
 fn target_info(target: &str, kind: &str, attached: bool) -> Value {
@@ -481,4 +503,108 @@ async fn an_error_answer_to_navigate_fails_the_navigation_at_once() {
         .await
         .expect("the next navigation was held behind the refused one")
         .expect("the next navigation");
+}
+
+/// U-3 fix 4: an `iframe` target auto-attached under the page (an out-of-process frame) is
+/// initialised like the root on its own session — its domains enabled, so its events flow, and its
+/// own automatic attachment set, so a frame nested inside it attaches and is initialised too. Its
+/// events reach its own frame tracking, and a page handle for it finds its frame. It used to get
+/// `Runtime.runIfWaitingForDebugger` and nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_auto_attached_child_is_initialised_like_the_root() {
+    const CHILD_SESSION: &str = "CHILD-SESSION-1";
+    const CHILD_TARGET: &str = "CHILD-TARGET-1";
+    const CHILD_FRAME: &str = "CHILD-FRAME-1";
+    const NESTED_SESSION: &str = "NESTED-SESSION-1";
+    const NESTED_TARGET: &str = "NESTED-TARGET-1";
+    const NESTED_FRAME: &str = "NESTED-FRAME-1";
+    let peer = Peer::start(|s| {
+        s.children.insert(
+            PAGE_SESSION.to_string(),
+            vec![(
+                CHILD_SESSION.into(),
+                CHILD_TARGET.into(),
+                CHILD_FRAME.into(),
+            )],
+        );
+        s.children.insert(
+            CHILD_SESSION.to_string(),
+            vec![(
+                NESTED_SESSION.into(),
+                NESTED_TARGET.into(),
+                NESTED_FRAME.into(),
+            )],
+        );
+    })
+    .await;
+    let (browser, _page, task, stop) = attach(&peer).await;
+
+    for session in [CHILD_SESSION, NESTED_SESSION] {
+        for method in [
+            "Runtime.runIfWaitingForDebugger",
+            "Page.enable",
+            "Page.getFrameTree",
+            "Page.setLifecycleEventsEnabled",
+            "Runtime.enable",
+            "Target.setAutoAttach",
+        ] {
+            peer.wait_call(method, Some(session)).await;
+        }
+    }
+
+    // A child's event reaches the child's own frame tracking.
+    peer.send(json!({
+        "method": "Page.frameNavigated",
+        "params": { "frame": frame(CHILD_FRAME, "http://child.test/"), "type": "Navigation" },
+        "sessionId": CHILD_SESSION,
+    }));
+    let child = browser
+        .get_page(TargetId::from(CHILD_TARGET.to_string()))
+        .await
+        .expect("a page handle for the child");
+    let start = Instant::now();
+    loop {
+        if child.url().await.expect("child url").as_deref() == Some("http://child.test/") {
+            break;
+        }
+        assert!(
+            start.elapsed() < PROMPT,
+            "the child's event did not reach its frame"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        child
+            .mainframe()
+            .await
+            .expect("child frame")
+            .map(|f| f.as_ref().to_owned()),
+        Some(CHILD_FRAME.to_owned())
+    );
+
+    // Unchanged for the caller: still one page, no second attachment, nothing closed.
+    assert_eq!(browser.pages().await.expect("pages").len(), 1);
+    assert_eq!(peer.calls("Target.attachToTarget", None).len(), 1);
+    assert!(peer.calls("Target.closeTarget", None).is_empty());
+    for session in [
+        Some(PAGE_SESSION),
+        Some(CHILD_SESSION),
+        Some(NESTED_SESSION),
+    ] {
+        assert!(peer.calls("Target.closeTarget", session).is_empty());
+    }
+
+    let _ = stop.send(());
+    let handler = task.await.expect("handler task");
+    let nested = handler
+        .get_target(&TargetId::from(NESTED_TARGET.to_string()))
+        .expect("the nested child is tracked");
+    assert_eq!(
+        nested.session_id().map(|s| s.as_ref()),
+        Some(NESTED_SESSION)
+    );
+    assert_eq!(
+        nested.frame_manager().main_frame().map(|f| f.id().as_ref()),
+        Some(NESTED_FRAME)
+    );
 }
