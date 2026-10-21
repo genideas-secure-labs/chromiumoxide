@@ -10,7 +10,8 @@ use futures::task::{Context, Poll};
 
 use chromiumoxide_cdp::cdp::CdpEventMessage;
 use chromiumoxide_cdp::cdp::browser_protocol::page::{
-    CreateIsolatedWorldParams, FrameId, GetFrameTreeParams,
+    AddScriptToEvaluateOnNewDocumentParams, CreateIsolatedWorldParams, FrameId,
+    GetFrameTreeParams,
 };
 use chromiumoxide_cdp::cdp::browser_protocol::{
     browser::BrowserContextId,
@@ -742,6 +743,11 @@ impl Target {
                 // churn, not a failed page (codex). The page still works; that
                 // frame simply has no utility world.
                 method != CreateIsolatedWorldParams::IDENTIFIER
+                    // The utility world's registration, for the same reason: refused, the page
+                    // has no utility world and still works. A peer that serves one lent tab
+                    // refuses it by policy (WinClaw's CDP relay, winclaw#2187), and failing the
+                    // page there closed the tab and ended the peer's attachment.
+                    && method != AddScriptToEvaluateOnNewDocumentParams::IDENTIFIER
                     // The browser-session detach that ends a failed recovery
                     // session can be refused too ("session not found"): that
                     // is the cleanup's answer, not the retry's
@@ -1601,6 +1607,21 @@ mod init_error_tests {
         t.on_response(
             reply(Some((-32000, "No frame for given id found"))),
             CreateIsolatedWorldParams::IDENTIFIER,
+        );
+        assert!(t.init_error.is_none());
+        assert!(!matches!(t.init_state, TargetInit::Closing));
+    }
+
+    #[test]
+    fn a_refused_utility_world_registration_is_not_a_failure() {
+        let mut t = page_target();
+        assert!(matches!(
+            poll(&mut t),
+            Some(TargetEvent::Request(_) | TargetEvent::Attach(..))
+        ));
+        t.on_response(
+            reply(Some((-32000, "not_allowlisted"))),
+            AddScriptToEvaluateOnNewDocumentParams::IDENTIFIER,
         );
         assert!(t.init_error.is_none());
         assert!(!matches!(t.init_state, TargetInit::Closing));
