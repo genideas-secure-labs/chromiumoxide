@@ -91,7 +91,8 @@ impl<T: EventMessage> Connection<T> {
         }
         if self.pending_flush.is_none() && !self.needs_flush {
             if let Some(cmd) = self.pending_commands.pop_front() {
-                tracing::trace!("Sending {:?}", cmd);
+                // Method name and call id only: the params can carry page content and secrets.
+                tracing::trace!(method = %cmd.method, id = %cmd.id, "Sending");
                 let msg = serde_json::to_string(&cmd)?;
                 self.ws.start_send_unpin(msg.into())?;
                 self.pending_flush = Some(cmd);
@@ -132,12 +133,31 @@ impl<T: EventMessage + Unpin> Stream for Connection<T> {
             Some(Ok(WsMessage::Text(text))) => {
                 let ready = match serde_json::from_str::<Message<T>>(&text) {
                     Ok(msg) => {
-                        tracing::trace!("Received {:?}", msg);
+                        // Call id or event method only: results and event params can carry page
+                        // content and secrets.
+                        match &msg {
+                            Message::Response(resp) => tracing::trace!(
+                                id = %resp.id,
+                                error = resp.error.is_some(),
+                                "Received response"
+                            ),
+                            Message::Event(event) => {
+                                tracing::trace!(method = %event.identifier(), "Received event")
+                            }
+                        }
                         Ok(msg)
                     }
                     Err(err) => {
-                        let msg = text.as_str().to_string();
-                        tracing::debug!(target: "chromiumoxide::conn::raw_ws::parse_errors", msg, "Failed to parse raw WS message {}", err);
+                        // Never the raw text, and not serde's message either: it can quote the value
+                        // it rejected. Its category and position are enough to diagnose.
+                        tracing::debug!(
+                            target: "chromiumoxide::conn::raw_ws::parse_errors",
+                            category = ?err.classify(),
+                            line = err.line(),
+                            column = err.column(),
+                            len = text.len(),
+                            "Failed to parse raw WS message"
+                        );
                         Err(CdpError::InvalidMessage(text.as_str().to_string(), err))
                     }
                 };

@@ -194,6 +194,8 @@ pub struct FrameManager {
     request_timeout: Duration,
     /// Track currently in progress navigation
     pending_navigations: VecDeque<(FrameNavigationRequest, NavigationWatcher)>,
+    /// Navigations ended by a session replacement, reported by `poll`.
+    failed_navigations: VecDeque<NavigationId>,
     /// The currently ongoing navigation
     navigation: Option<(NavigationWatcher, Instant)>,
 }
@@ -207,8 +209,42 @@ impl FrameManager {
             isolated_worlds: Default::default(),
             request_timeout,
             pending_navigations: Default::default(),
+            failed_navigations: Default::default(),
             navigation: None,
         }
+    }
+
+    /// Forget what belonged to the DevTools session that just ended
+    /// (screen-play-rs#1041): execution contexts and isolated worlds are
+    /// per-session, so a re-attached session must create them again — the
+    /// initialization chain does, once `isolated_worlds` no longer claims them.
+    /// Frames themselves stay: the page did not navigate, and the chain's
+    /// `Page.getFrameTree` refreshes them.
+    #[cfg(test)]
+    pub(crate) fn claim_isolated_world_for_test(&mut self, name: &str) {
+        self.isolated_worlds.insert(name.to_string());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_isolated_world_for_test(&self, name: &str) -> bool {
+        self.isolated_worlds.contains(name)
+    }
+
+    pub fn on_session_replaced(&mut self) {
+        // Navigations asked of the old session end with an error instead of
+        // being sent on the new one: they would load a document before the
+        // caller's state (UA, init scripts) is back on it (codex final).
+        if let Some((watcher, _)) = self.navigation.take() {
+            self.failed_navigations.push_back(watcher.id);
+        }
+        for (req, _) in self.pending_navigations.drain(..) {
+            self.failed_navigations.push_back(req.id);
+        }
+        for frame in self.frames.values_mut() {
+            frame.clear_contexts();
+        }
+        self.context_ids.clear();
+        self.isolated_worlds.clear();
     }
 
     /// The commands to execute in order to initialize this frame manager.
@@ -304,6 +340,11 @@ impl FrameManager {
     }
 
     pub fn poll(&mut self, now: Instant) -> Option<FrameEvent> {
+        if let Some(id) = self.failed_navigations.pop_front() {
+            return Some(FrameEvent::NavigationResult(Err(
+                NavigationError::SessionReplaced { id },
+            )));
+        }
         // check if the navigation completed
         if let Some((watcher, deadline)) = self.navigation.take() {
             if now > deadline {
@@ -339,6 +380,20 @@ impl FrameManager {
             return Some(FrameEvent::NavigationRequest(req.id, req.req));
         }
         None
+    }
+
+    /// Stop watching navigation `id`: its `Page.navigate` was answered with an error, so no page
+    /// load will complete it, and the handler has already completed it with that error. The
+    /// watcher is the one ongoing navigation once its request was sent, so dropping it lets the
+    /// next queued navigation start now instead of after the watcher's deadline.
+    pub(crate) fn abort_navigation(&mut self, id: NavigationId) {
+        if self
+            .navigation
+            .as_ref()
+            .is_some_and(|(watcher, _)| watcher.id == id)
+        {
+            self.navigation = None;
+        }
     }
 
     /// Entrypoint for page navigation
@@ -584,6 +639,12 @@ pub enum NavigationError {
         id: NavigationId,
         frame: FrameId,
     },
+    /// The target's session was replaced before this navigation finished
+    /// (screen-play-rs#1041): it was asked of a session that is gone, and
+    /// whoever restores the page's state on the new one has not yet — retry.
+    SessionReplaced {
+        id: NavigationId,
+    },
 }
 
 impl NavigationError {
@@ -591,6 +652,7 @@ impl NavigationError {
         match self {
             NavigationError::Timeout { id, .. } => id,
             NavigationError::FrameNotFound { id, .. } => id,
+            NavigationError::SessionReplaced { id } => id,
         }
     }
 }

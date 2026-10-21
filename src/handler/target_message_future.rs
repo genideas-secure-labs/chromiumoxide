@@ -7,6 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use crate::handler::page_channel_error;
 use crate::handler::target::TargetMessage;
 use crate::{ArcHttpRequest, error::Result};
 
@@ -53,10 +54,12 @@ impl<T> Future for TargetMessageFuture<T> {
 
         if this.message.is_some() {
             match this.target_sender.poll_ready(cx) {
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(page_channel_error(e))),
                 Poll::Ready(Ok(_)) => {
                     let message = this.message.take().expect("existence checked above");
-                    this.target_sender.start_send(message)?;
+                    this.target_sender
+                        .start_send(message)
+                        .map_err(page_channel_error)?;
 
                     cx.waker().wake_by_ref();
                     Poll::Pending
@@ -64,7 +67,10 @@ impl<T> Future for TargetMessageFuture<T> {
                 Poll::Pending => Poll::Pending,
             }
         } else {
-            this.rx_request.as_mut().poll(cx).map_err(Into::into)
+            this.rx_request
+                .as_mut()
+                .poll(cx)
+                .map_err(page_channel_error)
         }
     }
 }
