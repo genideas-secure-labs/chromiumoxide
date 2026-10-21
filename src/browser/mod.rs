@@ -222,6 +222,7 @@ impl Browser {
             request_intercept: config.request_intercept,
             cache_enabled: config.cache_enabled,
             stealth_mode: config.hidden,
+            session_recovery: true,
         };
 
         let fut = Handler::new(conn, rx, handler_config);

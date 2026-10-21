@@ -433,7 +433,9 @@ impl Target {
         if matches!(self.init_state, TargetInit::Closing) {
             return;
         }
-        if !self.desired_attached {
+        // Not recovered: detached on purpose, or a handler configured without recovery
+        // (`session_recovery: false`), whose peer's detach is final.
+        if !self.desired_attached || !self.config.session_recovery {
             // Detached on purpose while still initializing: nothing will
             // finish that initialization, so whoever waits is told now.
             if self.init_state.commands_mut().is_some()
@@ -485,9 +487,11 @@ impl Target {
     }
 
     /// Whether discovery should start a re-attach for this target: it should
-    /// be attached, has no session, and nothing is already attaching it.
+    /// be attached, has no session, and nothing is already attaching it. Never
+    /// without `session_recovery` — discovery is an automatic recovery too.
     pub(crate) fn wants_revival(&self) -> bool {
         self.is_page()
+            && self.config.session_recovery
             && self.desired_attached
             && self.session_id.is_none()
             && !self.attach_in_flight
@@ -1327,6 +1331,8 @@ pub struct TargetConfig {
     pub cache_enabled: bool,
     /// Stealth mode: minimize CDP domain enables to reduce bot detection footprint.
     pub stealth_mode: bool,
+    /// Whether a lost session is recovered ([`super::HandlerConfig::session_recovery`]).
+    pub session_recovery: bool,
 }
 
 impl Default for TargetConfig {
@@ -1338,6 +1344,7 @@ impl Default for TargetConfig {
             request_intercept: false,
             cache_enabled: true,
             stealth_mode: false,
+            session_recovery: true,
         }
     }
 }

@@ -556,6 +556,7 @@ impl Handler {
                 request_intercept: self.config.request_intercept,
                 cache_enabled: self.config.cache_enabled,
                 stealth_mode: self.config.stealth_mode,
+                session_recovery: self.config.session_recovery,
             },
             browser_ctx,
         );
@@ -686,6 +687,7 @@ impl Handler {
                 request_intercept: false,
                 cache_enabled: self.config.cache_enabled,
                 stealth_mode: self.config.stealth_mode,
+                session_recovery: self.config.session_recovery,
             },
             browser_ctx,
             event.session_id.clone(),
@@ -1110,6 +1112,11 @@ pub struct HandlerConfig {
     /// request_intercept is on), Page.createIsolatedWorld, and sets
     /// waitForDebuggerOnStart to false.
     pub stealth_mode: bool,
+    /// Whether a page that loses its session re-attaches in place (screen-play-rs#1041). `false`
+    /// leaves it detached, as an intentional `detach_target` does: for a peer whose detach is the
+    /// end of what it lent — WinClaw's CDP relay serves one lent tab, and a session it ended must
+    /// see nothing more (winclaw#2202).
+    pub session_recovery: bool,
 }
 
 impl Default for HandlerConfig {
@@ -1123,6 +1130,7 @@ impl Default for HandlerConfig {
             request_intercept: false,
             cache_enabled: true,
             stealth_mode: false,
+            session_recovery: true,
         }
     }
 }

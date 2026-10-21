@@ -775,3 +775,58 @@ async fn a_command_unanswered_on_a_quiet_connection_times_out() {
         start.elapsed()
     );
 }
+
+/// Detach the page's session without destroying the target, as a peer that ends a lent tab's
+/// session may do before (or without) its destruction, and wait until the handler has handled it:
+/// the detach has reached a browser listener and a later round trip was answered.
+async fn detach_only(peer: &Peer, browser: &mut Browser) {
+    let mut detached = browser
+        .event_listener::<EventDetachedFromTarget>()
+        .await
+        .expect("listen");
+    peer.send(json!({
+        "method": "Target.detachedFromTarget",
+        "params": { "sessionId": PAGE_SESSION, "targetId": PAGE_TARGET },
+    }));
+    tokio::time::timeout(PROMPT, detached.next())
+        .await
+        .expect("the detach did not arrive")
+        .expect("listener open");
+    browser.fetch_targets().await.expect("a round trip after the detach");
+}
+
+/// winclaw#2202: with `session_recovery: false` a lost session stays lost — the handler sends no
+/// second `Target.attachToTarget`, so nothing more reaches what the peer ended. WinClaw's CDP relay
+/// runs this way; a lent tab whose session ended must see nothing after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_recovery_a_lost_session_is_not_reattached() {
+    let peer = Peer::start(|_| {}).await;
+    let config = HandlerConfig {
+        session_recovery: false,
+        ..config()
+    };
+    let (mut browser, _page, _task, _stop) = attach_with(&peer, config).await;
+    assert_eq!(peer.calls("Target.attachToTarget", None).len(), 1);
+    detach_only(&peer, &mut browser).await;
+    // Another round trip: a re-attach started by the detach would have been sent by now.
+    browser.fetch_targets().await.expect("a second round trip");
+    assert_eq!(
+        peer.calls("Target.attachToTarget", None).len(),
+        1,
+        "the lost session was re-attached"
+    );
+}
+
+/// The default is unchanged (screen-play-rs#1041): a lost session re-attaches in place. This is the
+/// control for the test above — the same detach, with recovery on, does send a second attach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn by_default_a_lost_session_is_reattached() {
+    let peer = Peer::start(|_| {}).await;
+    let (mut browser, _page, _task, _stop) = attach(&peer).await;
+    detach_only(&peer, &mut browser).await;
+    let start = Instant::now();
+    while peer.calls("Target.attachToTarget", None).len() < 2 {
+        assert!(start.elapsed() < PROMPT, "no re-attach after the lost session");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
