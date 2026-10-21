@@ -276,9 +276,25 @@ impl Handler {
                 PendingRequest::ExternalCommand(tx) => {
                     let _ = tx.send(Ok(resp)).ok();
                 }
-                PendingRequest::InternalCommand(target_id) => {
+                PendingRequest::Detach(target_id, session, decision, tx) => {
+                    let result = match resp.error {
+                        Some(err) => {
+                            self.on_detach_failed(&target_id, &session, decision);
+                            Err(CdpError::Chrome(err))
+                        }
+                        None => Ok(()),
+                    };
+                    let _ = tx.send(result);
+                }
+                PendingRequest::InternalCommand(target_id, session, attempt) => {
                     if let Some(target) = self.targets.get_mut(&target_id) {
-                        target.on_response(resp, method.as_ref());
+                        // A command sent on a session the target no longer has
+                        // answers for that old session, not the current
+                        // initialization (screen-play-rs#1041, codex R1); an
+                        // attach answers for its own attempt (codex R4).
+                        if target.answers_current(session.as_deref(), attempt) {
+                            target.on_response(resp, method.as_ref());
+                        }
                     }
                 }
                 PendingRequest::CloseBrowser(tx) => {
@@ -305,12 +321,15 @@ impl Handler {
         Ok(())
     }
 
+    /// `attempt`: the attach attempt, for a target's `Target.attachToTarget`.
     pub(crate) fn submit_internal_command(
         &mut self,
         target_id: TargetId,
         req: CdpRequest,
+        attempt: Option<u64>,
         now: Instant,
     ) -> Result<()> {
+        let session = req.session_id.clone();
         let call_id = self.conn.submit_command(
             req.method.clone(),
             req.session_id.map(Into::into),
@@ -318,7 +337,11 @@ impl Handler {
         )?;
         self.pending_commands.insert(
             call_id,
-            (PendingRequest::InternalCommand(target_id), req.method, now),
+            (
+                PendingRequest::InternalCommand(target_id, session, attempt),
+                req.method,
+                now,
+            ),
         );
         Ok(())
     }
@@ -433,6 +456,10 @@ impl Handler {
         if let Some(ref session_id) = event.session_id {
             if let Some(session) = self.sessions.get(session_id.as_str()) {
                 if let Some(target) = self.targets.get_mut(session.target_id()) {
+                    if !target.accepts_event_from(session_id) {
+                        // A superseded session's late event (#1041, codex R7).
+                        return;
+                    }
                     // A target's automatic attachment reports its children on its own session.
                     let child = match &event.params {
                         CdpEvent::TargetAttachedToTarget(ev)
@@ -497,15 +524,21 @@ impl Handler {
         // The init-failure path does not need this: `on_initialization_failed`
         // moves the target to `Closing` and sends `Target.closeTarget`, and the
         // resulting `targetDestroyed` removes the entry outright.
+        //
+        // screen-play-rs#1041 changed the second half: discovery no longer
+        // REPLACES a target that lost its session — replacing threw away its
+        // network settings, listeners and page channel, and could not tell an
+        // intentional detach from a lost session. A tracked target is never
+        // replaced. If it should be attached and has no session, discovery
+        // starts the same in-place re-attach a lost session starts (rationed
+        // by the recovery budget); a target detached on purpose
+        // (`Browser::detach_target`) is left alone.
         if let Some(existing) = self.targets.get_mut(&event.target_info.target_id) {
-            let stranded = existing.is_initialized() && existing.session_id().is_none();
-            if !stranded {
-                // Keep the live target, but do not let its metadata freeze at
-                // the first snapshot — this crate does not handle
-                // `Target.targetInfoChanged`, so discovery is the only refresh.
-                existing.refresh_metadata(&event.target_info);
-                return;
-            }
+            // Do not let its metadata freeze at the first snapshot — this
+            // crate does not handle `Target.targetInfoChanged`, so discovery
+            // is the only refresh.
+            existing.on_rediscovered(&event.target_info, Instant::now());
+            return;
         }
         let browser_ctx = event
             .target_info
@@ -556,7 +589,10 @@ impl Handler {
         // drive this path on every `cargo test`, and the defect is invisible
         // from the wire, so a comment could never be more than a claim.
         debug_assert_eq!(
-            self.target_ids.iter().filter(|id| **id == target_id).count(),
+            self.target_ids
+                .iter()
+                .filter(|id| **id == target_id)
+                .count(),
             1,
             "target {target_id:?} must appear in `target_ids` exactly once"
         );
@@ -565,8 +601,38 @@ impl Handler {
     /// A new session is attached to a target
     fn on_attached_to_target(&mut self, event: Box<EventAttachedToTarget>) {
         let session = Session::new(event.session_id.clone(), event.target_info.target_id);
+        let mut refuse = false;
         if let Some(target) = self.targets.get_mut(session.target_id()) {
-            target.set_session_id(session.session_id().clone())
+            if !target.desired_attached() {
+                // Detached on purpose while this attach was in flight
+                // (screen-play-rs#1041, codex R1): end the session it brought
+                // instead of adopting it.
+                target.abandon_attachment();
+                refuse = true;
+            } else if target.expects_session() {
+                target.set_session_id(session.session_id().clone())
+            } else {
+                // A session nothing is waiting for — a timed-out attach that
+                // answered after recovery gave up: adopting it would expose a
+                // page whose session never ran its initialization (codex R4).
+                refuse = true;
+            }
+        }
+        if refuse {
+            let params = crate::cdp::browser_protocol::target::DetachFromTargetParams::builder()
+                .session_id(session.session_id().clone())
+                .build();
+            let target_id = session.target_id().clone();
+            let _ = self.submit_internal_command(
+                target_id,
+                CdpRequest {
+                    method: params.identifier(),
+                    session_id: None,
+                    params: serde_json::to_value(params).unwrap(),
+                },
+                None,
+                Instant::now(),
+            );
         }
         self.sessions.insert(event.session_id, session);
     }
@@ -671,7 +737,10 @@ impl Handler {
                 // would spuriously return `CdpError::NotFound`.
                 let is_current = target.session_id() == Some(&event.session_id);
                 if is_current {
-                    target.session_id_mut().take();
+                    // screen-play-rs#1041: the target decides what follows —
+                    // re-attach in place if it should stay attached, stay
+                    // detached if it was detached on purpose.
+                    target.on_session_lost(Instant::now());
                     // Also drop the cached PageHandle so any caller
                     // that races a `Target.attachToTarget` reply against
                     // the matching `attachedToTarget` event window —
@@ -704,7 +773,63 @@ impl Handler {
     ///
     /// Remove all commands where `now` > `timestamp of command starting point +
     /// request timeout` and notify the senders that their request timed out.
-    fn evict_timed_out_commands(&mut self, now: Instant) {
+    /// Record that `target_id` should stay detached and end its session on the
+    /// browser's own session (screen-play-rs#1041). Answers `tx` when Chrome
+    /// does; a target without a session is answered at once.
+    fn detach_target(&mut self, target_id: TargetId, tx: OneshotSender<Result<()>>, now: Instant) {
+        let Some(target) = self.targets.get_mut(&target_id) else {
+            let _ = tx.send(Ok(()));
+            return;
+        };
+        let Some((session, decision)) = target.begin_detach() else {
+            let _ = tx.send(Ok(()));
+            return;
+        };
+        let params = crate::cdp::browser_protocol::target::DetachFromTargetParams::builder()
+            .session_id(session.clone())
+            .build();
+        let method = params.identifier();
+        match self
+            .conn
+            .submit_command(method.clone(), None, serde_json::to_value(params).unwrap())
+        {
+            Ok(call_id) => {
+                self.pending_commands.insert(
+                    call_id,
+                    (
+                        PendingRequest::Detach(
+                            target_id,
+                            session.as_ref().to_string(),
+                            decision,
+                            tx,
+                        ),
+                        method,
+                        now,
+                    ),
+                );
+            }
+            Err(err) => {
+                self.on_detach_failed(&target_id, session.as_ref(), decision);
+                let _ = tx.send(Err(err.into()));
+            }
+        }
+    }
+
+    /// An intentional detach of `session` failed: if that session is still
+    /// the target's and no newer decision replaced this one, the target is
+    /// attached after all (codex R9: an overlapping detach that succeeded
+    /// must not be undone by one that failed because the session was gone).
+    /// Returns whether the target must be polled again.
+    fn on_detach_failed(&mut self, target_id: &TargetId, session: &str, decision: u64) -> bool {
+        self.targets
+            .get_mut(target_id)
+            .is_some_and(|target| target.on_detach_failed(session, decision))
+    }
+
+    /// Returns whether a target was told its attach timed out: it must be
+    /// polled again, which nothing else may trigger on an idle connection.
+    fn evict_timed_out_commands(&mut self, now: Instant) -> bool {
+        let mut marked = false;
         let timed_out = self
             .pending_commands
             .iter()
@@ -732,13 +857,33 @@ impl Handler {
                     PendingRequest::ExternalCommand(tx) => {
                         let _ = tx.send(Err(CdpError::Timeout));
                     }
-                    PendingRequest::InternalCommand(_) => {}
+                    PendingRequest::Detach(target_id, session, decision, tx) => {
+                        // A restarted initialization needs a poll, which an
+                        // idle connection would not bring (codex R10).
+                        if self.on_detach_failed(&target_id, &session, decision) {
+                            marked = true;
+                        }
+                        let _ = tx.send(Err(CdpError::Timeout));
+                    }
+                    PendingRequest::InternalCommand(target_id, _, Some(attempt)) => {
+                        // An attach that never answered leaves no session to
+                        // time out on; tell the target, or it counts as
+                        // attaching forever (screen-play-rs#1041, codex R3) —
+                        // unless a newer attempt replaced it (codex R4).
+                        if let Some(target) = self.targets.get_mut(&target_id) {
+                            if target.on_attach_timed_out(attempt) {
+                                marked = true;
+                            }
+                        }
+                    }
+                    PendingRequest::InternalCommand(..) => {}
                     PendingRequest::CloseBrowser(tx) => {
                         let _ = tx.send(Err(CdpError::Timeout));
                     }
                 }
             }
         }
+        marked
     }
 
     pub fn event_listeners_mut(&mut self) -> &mut EventListeners {
@@ -795,6 +940,17 @@ impl Stream for Handler {
                             .map(|page| Page::from(page.clone()));
                         let _ = tx.send(page);
                     }
+                    HandlerMessage::Detach(target_id, tx) => {
+                        pin.detach_target(target_id, tx, now);
+                    }
+                    HandlerMessage::Reattach(target_id, tx) => {
+                        match pin.targets.get_mut(&target_id) {
+                            Some(target) => target.reattach(now, tx),
+                            None => {
+                                let _ = tx.send(Err(CdpError::NotFound));
+                            }
+                        }
+                    }
                     HandlerMessage::AddEventListener(req) => {
                         pin.event_listeners.add_listener(req);
                     }
@@ -810,6 +966,15 @@ impl Stream for Handler {
                                 let _ = pin.submit_internal_command(
                                     target.target_id().clone(),
                                     req,
+                                    None,
+                                    now,
+                                );
+                            }
+                            TargetEvent::Attach(req, attempt) => {
+                                let _ = pin.submit_internal_command(
+                                    target.target_id().clone(),
+                                    req,
+                                    Some(attempt),
                                     now,
                                 );
                             }
@@ -821,6 +986,15 @@ impl Stream for Handler {
                             }
                             TargetEvent::NavigationResult(res) => {
                                 pin.on_navigation_lifecycle_completed(res)
+                            }
+                            TargetEvent::SessionRestored(ev) => {
+                                // Also to `Browser::event_listener` subscribers,
+                                // so one listener per browser sees every tab's
+                                // restoration (screen-play-rs#1041).
+                                let _ = pin.event_listeners.try_send_custom(
+                                    "Chromiumoxide.sessionRestored",
+                                    serde_json::to_value(&ev).unwrap(),
+                                );
                             }
                         }
                     }
@@ -898,8 +1072,12 @@ impl Stream for Handler {
             pin.event_listeners_mut().poll(cx);
 
             if pin.evict_command_timeout.poll_ready(cx) {
-                // evict all commands that timed out
-                pin.evict_timed_out_commands(now);
+                // evict all commands that timed out; a target told its attach
+                // timed out is polled again now, not at the next unrelated
+                // wakeup (screen-play-rs#1041, codex R4)
+                if pin.evict_timed_out_commands(now) {
+                    done = false;
+                }
             }
 
             if done {
@@ -1007,8 +1185,15 @@ enum PendingRequest {
     /// A common request received via a channel (`Page`).
     ExternalCommand(OneshotSender<Result<Response>>),
     /// Requests that are initiated directly from a `Target` (all the
-    /// initialization commands).
-    InternalCommand(TargetId),
+    /// initialization commands): its target, the session it was sent on
+    /// (`None` for a browser-level command such as the attach), and — for a
+    /// `Target.attachToTarget` — which attach attempt of that target it
+    /// belongs to, so an abandoned attempt's answer or timeout cannot land on
+    /// a newer one (screen-play-rs#1041, codex R4).
+    InternalCommand(TargetId, Option<String>, Option<u64>),
+    /// An intentional detach (`Browser::detach_target`): the target, the
+    /// session it ends, and the caller (screen-play-rs#1041, codex R9).
+    Detach(TargetId, String, u64, OneshotSender<Result<()>>),
     // A Request to close the browser.
     CloseBrowser(OneshotSender<Result<CloseReturns>>),
 }
@@ -1025,6 +1210,13 @@ pub(crate) enum HandlerMessage {
     GetPages(OneshotSender<Vec<Page>>),
     Command(CommandMessage),
     GetPage(TargetId, OneshotSender<Option<Page>>),
+    /// Detach a target on purpose: record that it should stay detached and
+    /// end its session, both here — so a caller that stops waiting cannot
+    /// leave the intent recorded without the detach sent (screen-play-rs#1041,
+    /// codex R9).
+    Detach(TargetId, OneshotSender<Result<()>>),
+    /// Re-attach a target in place and answer with its page once initialized.
+    Reattach(TargetId, OneshotSender<Result<Page>>),
     AddEventListener(EventListenerRequest),
     CloseBrowser(OneshotSender<Result<CloseReturns>>),
 }

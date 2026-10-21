@@ -103,6 +103,9 @@ impl From<NavigationError> for CdpError {
         match err {
             NavigationError::Timeout { .. } => CdpError::Timeout,
             NavigationError::FrameNotFound { frame, .. } => CdpError::FrameNotFound(frame),
+            NavigationError::SessionReplaced { .. } => {
+                CdpError::msg("the target's session was replaced during the navigation; retry it")
+            }
         }
     }
 }
