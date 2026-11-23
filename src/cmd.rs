@@ -16,6 +16,14 @@ use crate::handler::REQUEST_TIMEOUT;
 #[cfg(feature = "pipe-transport")]
 pub mod lifecycle;
 
+#[cfg(feature = "pipe-transport")]
+pub(crate) use lifecycle::CallContext;
+
+/// Without the `pipe-transport` feature a command carries no lifecycle.
+#[cfg(not(feature = "pipe-transport"))]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CallContext {}
+
 /// Deserialize a response
 pub(crate) fn to_command_response<T: Command>(
     resp: Response,
@@ -45,6 +53,10 @@ pub struct CommandMessage<T = Result<Response>> {
     pub params: serde_json::Value,
     #[serde(skip_serializing)]
     pub sender: OneshotSender<T>,
+    /// The deadline and cancellation the caller stamped (pipe connections only).
+    #[cfg(feature = "pipe-transport")]
+    #[serde(skip)]
+    pub(crate) ctx: CallContext,
 }
 
 impl<T> CommandMessage<T> {
@@ -54,7 +66,28 @@ impl<T> CommandMessage<T> {
             session_id: None,
             params: serde_json::to_value(cmd)?,
             sender,
+            #[cfg(feature = "pipe-transport")]
+            ctx: CallContext::default(),
         })
+    }
+
+    /// The lifecycle this command carries, if any.
+    pub(crate) fn call_context(&self) -> CallContext {
+        #[cfg(feature = "pipe-transport")]
+        {
+            self.ctx.clone()
+        }
+        #[cfg(not(feature = "pipe-transport"))]
+        {
+            CallContext {}
+        }
+    }
+
+    /// Carry `ctx` to the connection.
+    #[cfg(feature = "pipe-transport")]
+    pub(crate) fn with_context(mut self, ctx: CallContext) -> Self {
+        self.ctx = ctx;
+        self
     }
 
     /// Whether this command is a navigation
@@ -72,6 +105,8 @@ impl<T> CommandMessage<T> {
             session_id,
             params: serde_json::to_value(cmd)?,
             sender,
+            #[cfg(feature = "pipe-transport")]
+            ctx: CallContext::default(),
         })
     }
 

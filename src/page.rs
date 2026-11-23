@@ -241,10 +241,10 @@ impl Page {
     #[cfg(feature = "pipe-transport")]
     pub async fn execute_with_timeout<T: Command>(
         &self,
-        _cmd: T,
-        _timeout: std::time::Duration,
+        cmd: T,
+        timeout: std::time::Duration,
     ) -> Result<CommandResponse<T::Response>> {
-        Err(CdpError::msg("pipe transport: not implemented"))
+        self.inner.execute_with_timeout(cmd, timeout).await
     }
 
     /// Execute a command and return the `Command::Response`

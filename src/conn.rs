@@ -19,14 +19,24 @@ use crate::error::Result;
 #[cfg(feature = "pipe-transport")]
 pub mod pipe;
 
+/// What a [`Connection`] exchanges its messages over.
+#[derive(Debug)]
+enum Io {
+    /// The DevTools WebSocket of the chromium instance.
+    Ws(Box<WebSocketStream<ConnectStream>>),
+    /// An owned byte pipe (screen-play-rs#1735).
+    #[cfg(feature = "pipe-transport")]
+    Pipe(Box<pipe::PipeIo>),
+}
+
 /// Exchanges the messages with the websocket
 #[must_use = "streams do nothing unless polled"]
 #[derive(Debug)]
 pub struct Connection<T: EventMessage> {
     /// Queue of commands to send.
     pending_commands: VecDeque<MethodCall>,
-    /// The websocket of the chromium instance
-    ws: WebSocketStream<ConnectStream>,
+    /// The websocket of the chromium instance, or the pipe
+    io: Io,
     /// The identifier for a specific command
     next_id: usize,
     needs_flush: bool,
@@ -47,14 +57,18 @@ impl<T: EventMessage + Unpin> Connection<T> {
         )
         .await?;
 
-        Ok(Self {
+        Ok(Self::from_io(Io::Ws(Box::new(ws))))
+    }
+
+    fn from_io(io: Io) -> Self {
+        Self {
             pending_commands: Default::default(),
-            ws,
+            io,
             next_id: 0,
             needs_flush: false,
             pending_flush: None,
             _marker: Default::default(),
-        })
+        }
     }
 }
 
@@ -73,6 +87,14 @@ impl<T: EventMessage> Connection<T> {
         session_id: Option<SessionId>,
         params: serde_json::Value,
     ) -> serde_json::Result<CallId> {
+        #[cfg(feature = "pipe-transport")]
+        if let Io::Pipe(pipe) = &mut self.io {
+            // Only the handler submits, and on a pipe it uses `submit_command_with`, whose
+            // refusals are typed. This keeps the signature for the WebSocket path.
+            return pipe
+                .admit(method, session_id, params, Default::default())
+                .map_err(|e| serde_json::Error::io(std::io::Error::other(e.to_string())));
+        }
         let id = self.next_call_id();
         let call = MethodCall {
             id,
@@ -87,8 +109,12 @@ impl<T: EventMessage> Connection<T> {
     /// flush any processed message and start sending the next over the conn
     /// sink
     fn start_send_next(&mut self, cx: &mut Context<'_>) -> Result<()> {
+        #[allow(irrefutable_let_patterns)]
+        let Io::Ws(ws) = &mut self.io else {
+            return Ok(());
+        };
         if self.needs_flush {
-            if let Poll::Ready(Ok(())) = self.ws.poll_flush_unpin(cx) {
+            if let Poll::Ready(Ok(())) = ws.poll_flush_unpin(cx) {
                 self.needs_flush = false;
             }
         }
@@ -97,11 +123,22 @@ impl<T: EventMessage> Connection<T> {
                 // Method name and call id only: the params can carry page content and secrets.
                 tracing::trace!(method = %cmd.method, id = %cmd.id, "Sending");
                 let msg = serde_json::to_string(&cmd)?;
-                self.ws.start_send_unpin(msg.into())?;
+                ws.start_send_unpin(msg.into())?;
                 self.pending_flush = Some(cmd);
             }
         }
         Ok(())
+    }
+}
+
+impl<T: EventMessage> Connection<T> {
+    /// The WebSocket; only the WebSocket paths call this.
+    fn ws(&mut self) -> &mut WebSocketStream<ConnectStream> {
+        match &mut self.io {
+            Io::Ws(ws) => ws,
+            #[cfg(feature = "pipe-transport")]
+            Io::Pipe(_) => unreachable!("the pipe returns before any WebSocket path"),
+        }
     }
 }
 
@@ -111,6 +148,11 @@ impl<T: EventMessage + Unpin> Stream for Connection<T> {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let pin = self.get_mut();
 
+        #[cfg(feature = "pipe-transport")]
+        if let Io::Pipe(pipe) = &mut pin.io {
+            return pipe.poll_next(cx);
+        }
+
         loop {
             // queue in the next message if not currently flushing
             if let Err(err) = pin.start_send_next(cx) {
@@ -119,7 +161,7 @@ impl<T: EventMessage + Unpin> Stream for Connection<T> {
 
             // send the message
             if let Some(call) = pin.pending_flush.take() {
-                if pin.ws.poll_ready_unpin(cx).is_ready() {
+                if pin.ws().poll_ready_unpin(cx).is_ready() {
                     pin.needs_flush = true;
                     // try another flush
                     continue;
@@ -132,7 +174,7 @@ impl<T: EventMessage + Unpin> Stream for Connection<T> {
         }
 
         // read from the ws
-        match ready!(pin.ws.poll_next_unpin(cx)) {
+        match ready!(pin.ws().poll_next_unpin(cx)) {
             Some(Ok(WsMessage::Text(text))) => {
                 let ready = match serde_json::from_str::<Message<T>>(&text) {
                     Ok(msg) => {

@@ -53,6 +53,30 @@ impl PageHandle {
             session_id,
             opener_id,
             sender: commands,
+            #[cfg(feature = "pipe-transport")]
+            pipe: None,
+        };
+        Self {
+            rx: rx.fuse(),
+            page: Arc::new(page),
+        }
+    }
+
+    /// A page on a pipe connection: its commands carry lifecycles stamped from `pipe`.
+    #[cfg(feature = "pipe-transport")]
+    pub(crate) fn new_on_pipe(
+        target_id: TargetId,
+        session_id: SessionId,
+        opener_id: Option<TargetId>,
+        pipe: crate::cmd::lifecycle::PipeContext,
+    ) -> Self {
+        let (commands, rx) = channel(1);
+        let page = PageInner {
+            target_id,
+            session_id,
+            opener_id,
+            sender: commands,
+            pipe: Some(pipe),
         };
         Self {
             rx: rx.fuse(),
@@ -71,17 +95,64 @@ pub(crate) struct PageInner {
     session_id: SessionId,
     opener_id: Option<TargetId>,
     sender: Sender<TargetMessage>,
+    /// Set on a pipe connection (screen-play-rs#1735).
+    #[cfg(feature = "pipe-transport")]
+    pipe: Option<crate::cmd::lifecycle::PipeContext>,
 }
 
 impl PageInner {
     /// Execute a PDL command and return its response
     pub(crate) async fn execute<T: Command>(&self, cmd: T) -> Result<CommandResponse<T::Response>> {
+        #[cfg(feature = "pipe-transport")]
+        if self.pipe.is_some() {
+            return self.command_future(cmd)?.await;
+        }
         execute(cmd, self.sender.clone(), Some(self.session_id.clone())).await
     }
 
     /// Create a PDL command future
     pub(crate) fn command_future<T: Command>(&self, cmd: T) -> Result<CommandFuture<T>> {
+        #[cfg(feature = "pipe-transport")]
+        if let Some(pipe) = &self.pipe {
+            return Ok(CommandFuture::deferred(
+                cmd,
+                self.sender.clone(),
+                Some(self.session_id.clone()),
+                pipe.clone(),
+                None,
+            ));
+        }
         CommandFuture::new(cmd, self.sender.clone(), Some(self.session_id.clone()))
+    }
+
+    /// [`PageInner::execute`] with a budget of `timeout`, capped by the configured one.
+    #[cfg(feature = "pipe-transport")]
+    pub(crate) async fn execute_with_timeout<T: Command>(
+        &self,
+        cmd: T,
+        timeout: std::time::Duration,
+    ) -> Result<CommandResponse<T::Response>> {
+        match &self.pipe {
+            Some(pipe) => {
+                CommandFuture::deferred(
+                    cmd,
+                    self.sender.clone(),
+                    Some(self.session_id.clone()),
+                    pipe.clone(),
+                    Some(timeout),
+                )
+                .await
+            }
+            None => {
+                // A WebSocket page: the caller-side bound only.
+                let call = std::pin::pin!(self.execute(cmd));
+                let delay = futures_timer::Delay::new(timeout);
+                match futures::future::select(call, delay).await {
+                    futures::future::Either::Left((res, _)) => res,
+                    futures::future::Either::Right(_) => Err(CdpError::Timeout),
+                }
+            }
+        }
     }
 
     /// This creates navigation future with the final http response when the page is loaded

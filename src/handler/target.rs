@@ -10,8 +10,7 @@ use futures::task::{Context, Poll};
 
 use chromiumoxide_cdp::cdp::CdpEventMessage;
 use chromiumoxide_cdp::cdp::browser_protocol::page::{
-    AddScriptToEvaluateOnNewDocumentParams, CreateIsolatedWorldParams, FrameId,
-    GetFrameTreeParams,
+    AddScriptToEvaluateOnNewDocumentParams, CreateIsolatedWorldParams, FrameId, GetFrameTreeParams,
 };
 use chromiumoxide_cdp::cdp::browser_protocol::{
     browser::BrowserContextId,
@@ -173,6 +172,12 @@ pub struct Target {
     session_generation: u64,
     /// Whoever called `Browser::reattach_target` and waits for the page.
     reattach_waiter: Option<Sender<Result<Page>>>,
+    /// The lifecycle of the `Browser::reattach_target` call that asked for the next attach, so the
+    /// attach is bounded and cancelled by its caller (screen-play-rs#1735).
+    attach_ctx: crate::cmd::CallContext,
+    /// Set on a pipe connection: this target's pages stamp their commands' lifecycles from it.
+    #[cfg(feature = "pipe-transport")]
+    pipe: Option<crate::cmd::lifecycle::PipeContext>,
 }
 
 impl Target {
@@ -214,6 +219,60 @@ impl Target {
             recoveries: VecDeque::new(),
             session_generation: 0,
             reattach_waiter: None,
+            attach_ctx: Default::default(),
+            #[cfg(feature = "pipe-transport")]
+            pipe: None,
+        }
+    }
+
+    /// This target is on a pipe connection.
+    #[cfg(feature = "pipe-transport")]
+    pub(crate) fn set_pipe_context(&mut self, pipe: crate::cmd::lifecycle::PipeContext) {
+        self.pipe = Some(pipe);
+    }
+
+    /// The lifecycle the next attach carries: the re-attaching caller's, once.
+    pub(crate) fn take_attach_context(&mut self) -> crate::cmd::CallContext {
+        std::mem::take(&mut self.attach_ctx)
+    }
+
+    /// [`Target::reattach`] on behalf of a caller whose lifecycle bounds the attach.
+    pub(crate) fn reattach_with(
+        &mut self,
+        now: Instant,
+        tx: Sender<Result<Page>>,
+        ctx: crate::cmd::CallContext,
+    ) {
+        self.attach_ctx = ctx;
+        self.reattach(now, tx);
+    }
+
+    /// The connection ended: everyone waiting on this target gets `err` now.
+    #[cfg(feature = "pipe-transport")]
+    pub(crate) fn fail_waiters(&mut self, err: impl Fn() -> CdpError) {
+        if let Some(initiator) = self.initiator.take() {
+            let _ = initiator.send(Err(err()));
+        }
+        if let Some(waiter) = self.reattach_waiter.take() {
+            let _ = waiter.send(Err(err()));
+        }
+        // These wait for a navigation response, not a `Result`: dropping them closes their
+        // receivers, which report the page closed.
+        self.wait_for_frame_navigation.clear();
+    }
+
+    /// The connection refused one of this target's own initialization commands: the
+    /// initialization fails at the next poll, as if Chrome had refused it, instead of waiting for
+    /// an answer that cannot come.
+    pub(crate) fn on_internal_refused(&mut self, method: &str, err: &CdpError) {
+        if self.init_state.commands_mut().is_some() && self.init_error.is_none() {
+            self.init_error = Some((
+                method.to_string(),
+                chromiumoxide_types::Error {
+                    code: -32000,
+                    message: err.to_string(),
+                },
+            ));
         }
     }
 
@@ -683,6 +742,16 @@ impl Target {
             .as_ref()
             .is_some_and(|p| p.inner().session_id() == &session);
         if !session_matches {
+            #[cfg(feature = "pipe-transport")]
+            if let Some(pipe) = &self.pipe {
+                self.page = Some(PageHandle::new_on_pipe(
+                    self.target_id().clone(),
+                    session,
+                    self.opener_id().cloned(),
+                    pipe.clone(),
+                ));
+                return;
+            }
             let handle =
                 PageHandle::new(self.target_id().clone(), session, self.opener_id().cloned());
             self.page = Some(handle);
