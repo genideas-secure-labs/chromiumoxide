@@ -1740,3 +1740,59 @@ async fn a_child_whose_initialization_is_refused_gives_no_page() {
     }
     drop(fill);
 }
+
+/// A successful `Browser.close` ends the pipe connection itself, not only the handler: the
+/// browser's writer is released while the caller still holds the ended handler, instead of when
+/// the handler is finally dropped (codex R1 F2 on chromiumoxide#10).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_closed_browser_releases_the_pipe_while_the_handler_is_held() {
+    let mut f = start(Opts::default(), |_| {});
+    eventually("the first request", || !f.peer.calls().is_empty()).await;
+    let close = tokio::time::timeout(PROMPT, f.browser.close())
+        .await
+        .expect("close settles in time");
+    assert!(close.is_ok(), "a plain answer to Browser.close: {close:?}");
+    let (mut handler, errs) = f.driver.join().await;
+    assert!(errs.is_empty(), "a clean close is not an error: {errs:?}");
+    eventually(
+        "the browser's writer is dropped while the handler is still held",
+        || f.peer.eof(),
+    )
+    .await;
+    assert_stays_ended(&mut handler);
+    drop(handler);
+}
+
+/// An error answer to `Browser.close` reaches the caller as that error, not as a successful
+/// close; and, like any CDP error answer on a pipe, it ends the connection with
+/// `ProtocolError`, releasing the writer while the handler is still held (codex R1 F2 + F3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_error_answer_to_browser_close_is_the_callers_error() {
+    let mut f = start(Opts::default(), |s| s.withheld.push("Browser.close".into()));
+    eventually("the first request", || !f.peer.calls().is_empty()).await;
+    let peer = &f.peer;
+    let (close, ()) = tokio::join!(
+        tokio::time::timeout(PROMPT, f.browser.close()),
+        async {
+            eventually("Browser.close is sent", || peer.saw_call("Browser.close")).await;
+            peer.release_error("Browser.close");
+        }
+    );
+    match close.expect("close settles in time") {
+        Err(CdpError::Chrome(err)) => assert_eq!(err.message, "scripted failure"),
+        other => panic!("an error answer to Browser.close was reported as {other:?}"),
+    }
+    let (mut handler, errs) = f.driver.join().await;
+    assert_eq!(
+        errs.iter().map(closed).collect::<Vec<_>>(),
+        vec![Some(PipeClosed::ProtocolError)],
+        "a CDP error answer ends the pipe with ProtocolError"
+    );
+    eventually(
+        "the browser's writer is dropped while the handler is still held",
+        || f.peer.eof(),
+    )
+    .await;
+    assert_stays_ended(&mut handler);
+    drop(handler);
+}

@@ -707,3 +707,119 @@ async fn pipe_id_exhaustion_refuses_without_bytes() {
         "exactly the two ids, no wrap"
     );
 }
+
+/// A writer that accepts `first` bytes on its first write and then runs `trip` (the deadline
+/// passes, or the caller cancels) before returning; every later write is accepted whole and
+/// every flush succeeds at once. So the connection sees only `Ready` I/O after the trip, and
+/// nothing outside its own write loop gets a chance to look at the lifecycle in between.
+struct TripWriter {
+    log: WriterLog,
+    first: usize,
+    trip: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl AsyncWrite for TripWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let n = match self.trip.take() {
+            Some(trip) => {
+                let n = buf.len().min(self.first);
+                self.log.bytes.lock().unwrap().extend_from_slice(&buf[..n]);
+                trip();
+                return Poll::Ready(Ok(n));
+            }
+            None => buf.len(),
+        };
+        self.log.bytes.lock().unwrap().extend_from_slice(&buf[..n]);
+        Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.log.flushes.fetch_add(1, Ordering::SeqCst);
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for TripWriter {
+    fn drop(&mut self) {
+        self.log.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+/// The deadline (or a cancel) that arrives between two `Ready` writes of the same frame stops the
+/// frame where it is: no further byte of it, and no flush, reaches the browser, and the
+/// connection ends with the typed reason. A NUL-delimited pipe cannot resynchronise after half a
+/// frame, so the frame is not abandoned with the connection kept: the connection ends. Finishing
+/// the frame instead would hand the browser a complete, executable command after its caller's
+/// deadline (codex R1 F1 on chromiumoxide#10).
+#[tokio::test]
+async fn a_deadline_between_ready_writes_stops_the_frame() {
+    const BUDGET: Duration = Duration::from_millis(100);
+    // (first bytes accepted, cancel instead of expire, the reason the connection must end with)
+    let cases = [
+        (1, false, PipeClosed::ActiveExpired),
+        (1, true, PipeClosed::ActiveCancelled),
+        // The whole frame in one write, then the deadline passes before the flush.
+        (usize::MAX, false, PipeClosed::ActiveExpired),
+    ];
+    for (first, cancel, want) in cases {
+        let case = format!("first={first} cancel={cancel}");
+        let log = WriterLog::default();
+        let clock = ManualClock::new();
+        let driver: DriverWaker = Arc::new(AtomicWaker::new());
+        let lc = CommandLifecycle::new(clock.now() + BUDGET, driver.clone());
+        let trip: Box<dyn FnOnce() + Send> = if cancel {
+            let lc = lc.clone();
+            Box::new(move || lc.cancel())
+        } else {
+            let clock = clock.clone();
+            Box::new(move || clock.advance(BUDGET + Duration::from_millis(1)))
+        };
+        let writer = TripWriter {
+            log: log.clone(),
+            first,
+            trip: Some(trip),
+        };
+        let (_peer, conn_r) = duplex(1 << 20);
+        let mut conn =
+            Conn::pipe(conn_r, writer, settings(&clock, &driver)).expect("pipe connection");
+        conn.submit_command_with(
+            "Runtime.evaluate".to_string().into(),
+            None,
+            json!({ "expression": "LATE-MARK" }),
+            CallContext::of(lc),
+        )
+        .unwrap();
+
+        let errs = pump_until_end(&mut conn);
+        let written = log.bytes.lock().unwrap().clone();
+        let full = first == usize::MAX;
+        if full {
+            assert_eq!(written.last(), Some(&0), "{case}: the frame was written whole");
+            assert_eq!(
+                log.flushes.load(Ordering::SeqCst),
+                0,
+                "{case}: no flush after the deadline"
+            );
+        } else {
+            assert_eq!(
+                written.len(),
+                first,
+                "{case}: no byte after the deadline (the frame's rest and its NUL stay unsent)"
+            );
+        }
+        assert_eq!(
+            errs.iter().map(closed).collect::<Vec<_>>(),
+            vec![Some(want)],
+            "{case}: the connection ends once, with the typed reason"
+        );
+        assert!(log.dropped.load(Ordering::SeqCst), "{case}: the writer is released");
+    }
+}
