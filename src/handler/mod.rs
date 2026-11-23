@@ -472,6 +472,17 @@ impl Handler {
                     }
                 }
                 PendingRequest::CloseBrowser(tx) => {
+                    // On a pipe, an error answer is the caller's error, and the browser is not
+                    // closing: the connection then ends with `ProtocolError`, as for any CDP
+                    // error answer on a pipe (codex R1 F3 on chromiumoxide#10). The WebSocket
+                    // path keeps its behaviour from before the pipe: any answer counts as closed.
+                    #[cfg(feature = "pipe-transport")]
+                    if self.is_pipe() {
+                        if let Some(err) = resp.error {
+                            let _ = tx.send(Err(CdpError::Chrome(err)));
+                            return;
+                        }
+                    }
                     self.closing = true;
                     let _ = tx.send(Ok(CloseReturns {})).ok();
                 }
@@ -1481,7 +1492,19 @@ impl Stream for Handler {
                         if pin.closing {
                             #[cfg(feature = "pipe-transport")]
                             if pin.is_pipe() {
-                                pin.terminate(crate::error::PipeClosed::Eof);
+                                // End the connection itself before reporting the end: `terminate`
+                                // settles the handler's waiters but leaves the endpoints alone,
+                                // and the fuse it sets stops the connection from being polled
+                                // again, so without this both pipe ends stayed open until the
+                                // handler was dropped (codex R1 F2 on chromiumoxide#10).
+                                let reason = pin.conn.end_pipe(crate::error::PipeClosed::Eof);
+                                pin.terminate(reason);
+                                if reason != crate::error::PipeClosed::Eof {
+                                    tracing::error!("pipe connection ended: {:?}", reason);
+                                    return Poll::Ready(Some(Err(CdpError::Pipe(
+                                        crate::error::PipeError::Closed(reason),
+                                    ))));
+                                }
                             }
                             // handler should stop processing
                             return Poll::Ready(None);

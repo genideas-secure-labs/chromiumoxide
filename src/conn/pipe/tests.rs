@@ -802,7 +802,11 @@ async fn a_deadline_between_ready_writes_stops_the_frame() {
         let written = log.bytes.lock().unwrap().clone();
         let full = first == usize::MAX;
         if full {
-            assert_eq!(written.last(), Some(&0), "{case}: the frame was written whole");
+            assert_eq!(
+                written.last(),
+                Some(&0),
+                "{case}: the frame was written whole"
+            );
             assert_eq!(
                 log.flushes.load(Ordering::SeqCst),
                 0,
@@ -820,6 +824,9 @@ async fn a_deadline_between_ready_writes_stops_the_frame() {
             vec![Some(want)],
             "{case}: the connection ends once, with the typed reason"
         );
-        assert!(log.dropped.load(Ordering::SeqCst), "{case}: the writer is released");
+        assert!(
+            log.dropped.load(Ordering::SeqCst),
+            "{case}: the writer is released"
+        );
     }
 }

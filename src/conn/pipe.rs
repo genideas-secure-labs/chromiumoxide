@@ -90,6 +90,33 @@ impl InFlight {
             Phase::Flushing | Phase::Awaiting => self.out.bytes.len(),
         }
     }
+
+    /// Whether the command on the wire may go on, at `now`.
+    fn verdict(&self, now: Instant) -> Verdict {
+        let lifecycle = &self.out.lifecycle;
+        if lifecycle.is_live(now) {
+            Verdict::Live
+        } else if self.written() == 0 {
+            Verdict::Unsent
+        } else if lifecycle.is_expired(now) {
+            // Checked first: a caller whose deadline passed also cancels on its way out, and the
+            // reason is still the deadline.
+            Verdict::End(PipeClosed::ActiveExpired)
+        } else {
+            Verdict::End(PipeClosed::ActiveCancelled)
+        }
+    }
+}
+
+/// What becomes of the command on the wire.
+enum Verdict {
+    Live,
+    /// Its caller is gone or late and no byte of it was written: drop it, nothing else changes.
+    Unsent,
+    /// Its caller is gone or late after some of its bytes were written. A NUL-delimited pipe
+    /// cannot resynchronise after part of a frame, and its effect is unknown: the connection
+    /// ends.
+    End(PipeClosed),
 }
 
 enum State {
@@ -261,18 +288,14 @@ impl PipeIo {
             live
         });
         if let Some(f) = &self.in_flight {
-            if !f.out.lifecycle.is_live(now) {
-                if f.written() == 0 {
+            match f.verdict(now) {
+                Verdict::Live => {}
+                Verdict::Unsent => {
                     let id = f.out.id;
                     self.in_flight = None;
                     self.retired.push(id);
-                } else if f.out.lifecycle.is_expired(now) {
-                    // Checked first: a caller whose deadline passed also cancels on its way out,
-                    // and the reason is still the deadline.
-                    return Err(PipeClosed::ActiveExpired);
-                } else {
-                    return Err(PipeClosed::ActiveCancelled);
                 }
+                Verdict::End(reason) => return Err(reason),
             }
         }
         Ok(())
@@ -295,6 +318,22 @@ impl PipeIo {
                 });
             }
             let f = self.in_flight.as_mut().expect("set above");
+            // Before every write and flush, not once per pass: a writer can be ready again and
+            // again while the deadline passes (or the caller leaves) between two of its calls,
+            // and the rest of the frame, with its NUL, would then hand the browser a complete
+            // command after its caller's deadline (codex R1 F1 on chromiumoxide#10).
+            if !matches!(f.phase, Phase::Awaiting) {
+                match f.verdict(self.settings.clock.now()) {
+                    Verdict::Live => {}
+                    Verdict::Unsent => {
+                        let id = f.out.id;
+                        self.in_flight = None;
+                        self.retired.push(id);
+                        continue;
+                    }
+                    Verdict::End(reason) => return Err(reason),
+                }
+            }
             match f.phase {
                 Phase::Writing(written) => {
                     match Pin::new(&mut **writer).poll_write(cx, &f.out.bytes[written..]) {
@@ -502,6 +541,24 @@ impl<T: EventMessage> Connection<T> {
         match &mut self.io {
             Io::Pipe(pipe) => pipe.admit(method, session_id, params, ctx),
             Io::Ws(_) => Ok(self.submit_command(method, session_id, params)?),
+        }
+    }
+
+    /// End a pipe connection now, for a reason of the handler's own (the browser was closed):
+    /// drop both endpoints and every command. A CDP error answer delivered just before, whose
+    /// ending is still pending, wins over `reason`; so does an end that already happened. Returns
+    /// the reason the connection ended with. On a WebSocket connection this does nothing.
+    pub(crate) fn end_pipe(&mut self, reason: PipeClosed) -> PipeClosed {
+        match &mut self.io {
+            Io::Pipe(pipe) => {
+                if let Some(ended) = pipe.closed_reason() {
+                    return ended;
+                }
+                let reason = pipe.end_after_delivery.take().unwrap_or(reason);
+                pipe.end(reason);
+                reason
+            }
+            Io::Ws(_) => reason,
         }
     }
 

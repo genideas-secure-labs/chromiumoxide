@@ -1771,13 +1771,10 @@ async fn an_error_answer_to_browser_close_is_the_callers_error() {
     let mut f = start(Opts::default(), |s| s.withheld.push("Browser.close".into()));
     eventually("the first request", || !f.peer.calls().is_empty()).await;
     let peer = &f.peer;
-    let (close, ()) = tokio::join!(
-        tokio::time::timeout(PROMPT, f.browser.close()),
-        async {
-            eventually("Browser.close is sent", || peer.saw_call("Browser.close")).await;
-            peer.release_error("Browser.close");
-        }
-    );
+    let (close, ()) = tokio::join!(tokio::time::timeout(PROMPT, f.browser.close()), async {
+        eventually("Browser.close is sent", || peer.saw_call("Browser.close")).await;
+        peer.release_error("Browser.close");
+    });
     match close.expect("close settles in time") {
         Err(CdpError::Chrome(err)) => assert_eq!(err.message, "scripted failure"),
         other => panic!("an error answer to Browser.close was reported as {other:?}"),
