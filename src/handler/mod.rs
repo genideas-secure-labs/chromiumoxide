@@ -1158,7 +1158,10 @@ impl Handler {
         self.sessions.clear();
         let rx = self.from_browser.get_mut();
         rx.close();
-        while let Ok(msg) = rx.try_recv() {
+        // `try_next`, not `try_recv`: the manifest allows any futures 0.3, and `try_recv` only
+        // exists from futures-channel 0.3.32 on; `try_next` exists in every 0.3 release.
+        #[allow(deprecated)]
+        while let Ok(Some(msg)) = rx.try_next() {
             Self::refuse(msg, &err);
         }
         self.ended = true;
