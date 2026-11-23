@@ -48,6 +48,9 @@ pub struct Browser {
     debug_ws_url: String,
     /// The context of the browser
     browser_context: BrowserContext,
+    /// Set when this browser is driven over an owned pipe (screen-play-rs#1735).
+    #[cfg(feature = "pipe-transport")]
+    pipe: Option<crate::cmd::lifecycle::PipeContext>,
 }
 
 /// See [`Browser::page_lookup`].
@@ -65,6 +68,37 @@ impl PageLookup {
             .send(HandlerMessage::GetPage(target_id, tx))
             .await?;
         rx.await?.ok_or(CdpError::NotFound)
+    }
+}
+
+/// How a [`Browser`] reaches its browser.
+#[cfg(feature = "pipe-transport")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// A DevTools WebSocket (`Browser::connect`, `Browser::launch`).
+    WebSocket,
+    /// An owned byte pipe ([`Browser::connect_pipe`]): no URL, no listener, no network endpoint.
+    Pipe,
+}
+
+/// How [`Browser::connect_pipe`] builds its handler.
+#[cfg(feature = "pipe-transport")]
+#[derive(Debug, Clone)]
+pub struct PipeConfig {
+    /// The handler's configuration. Its `request_timeout` is the budget every command gets,
+    /// counted from the first poll of the call that makes it.
+    pub handler: HandlerConfig,
+    /// The clock deadlines are stamped and checked with.
+    pub clock: std::sync::Arc<dyn crate::cmd::lifecycle::LifecycleClock>,
+}
+
+#[cfg(feature = "pipe-transport")]
+impl Default for PipeConfig {
+    fn default() -> Self {
+        Self {
+            handler: HandlerConfig::default(),
+            clock: std::sync::Arc::new(crate::cmd::lifecycle::SystemClock),
+        }
     }
 }
 
@@ -118,7 +152,7 @@ impl Browser {
                     } else {
                         format!(
                             "{}{}json/version",
-                            &debug_ws_url,
+                            debug_ws_url,
                             if debug_ws_url.ends_with('/') { "" } else { "/" }
                         )
                     },
@@ -157,8 +191,97 @@ impl Browser {
             child: None,
             debug_ws_url,
             browser_context,
+            #[cfg(feature = "pipe-transport")]
+            pipe: None,
         };
         Ok((browser, fut))
+    }
+
+    /// Drive a browser over an owned byte pipe: CDP messages delimited by NUL, as Chrome's
+    /// `--remote-debugging-pipe` speaks it. `reader` gives the browser's output, `writer` takes
+    /// its input. Nothing is resolved, listened on or launched, and nothing falls back to a
+    /// network endpoint.
+    #[cfg(feature = "pipe-transport")]
+    ///
+    /// Every command gets the handler's `request_timeout` as its budget, counted from the first
+    /// poll of the call that makes it; see [`crate::conn::pipe`] for what the connection
+    /// guarantees. The returned [`Handler`] is the only thing that reads and writes the pipe: poll
+    /// it until it ends, and drop it to release both endpoints. If the first command (target
+    /// discovery) cannot be admitted, this fails and both endpoints are dropped.
+    #[cfg(feature = "pipe-transport")]
+    pub fn connect_pipe<R, W>(reader: R, writer: W, config: PipeConfig) -> Result<(Self, Handler)>
+    where
+        R: tokio::io::AsyncRead + Send + Unpin + 'static,
+        W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        use crate::cmd::lifecycle::PipeContext;
+        use crate::conn::pipe::PipeSettings;
+
+        let driver = std::sync::Arc::new(futures::task::AtomicWaker::new());
+        let budget = config.handler.request_timeout;
+        let ctx = PipeContext {
+            clock: config.clock.clone(),
+            budget,
+            driver: driver.clone(),
+        };
+        let conn = Connection::<CdpEventMessage>::pipe(
+            reader,
+            writer,
+            PipeSettings {
+                clock: config.clock,
+                default_timeout: budget,
+                driver,
+            },
+        )?;
+        let (tx, rx) = channel(1);
+        let handler = Handler::new_pipe(conn, rx, config.handler, ctx.clone())?;
+        let browser_context = handler.default_browser_context().clone();
+        let browser = Self {
+            sender: tx,
+            config: None,
+            child: None,
+            // No endpoint exists; the legacy accessor reads empty, never a reconnect URL.
+            debug_ws_url: String::new(),
+            browser_context,
+            pipe: Some(ctx),
+        };
+        Ok((browser, handler))
+    }
+
+    /// Send what `make` builds to the handler with a lifecycle stamped now (the first poll of
+    /// the calling API future), and wait for its answer until that lifecycle's deadline. Dropping
+    /// the future first cancels the command.
+    #[cfg(feature = "pipe-transport")]
+    async fn pipe_call<R>(
+        &self,
+        pipe: &crate::cmd::lifecycle::PipeContext,
+        timeout: Option<std::time::Duration>,
+        make: impl FnOnce(futures::channel::oneshot::Sender<Result<R>>) -> Result<HandlerMessage>,
+    ) -> Result<R> {
+        use crate::cmd::lifecycle::{CallContext, CancelGuard};
+        use futures::future::{Either, select};
+
+        let lifecycle = pipe.start(timeout);
+        let mut guard = CancelGuard::new(lifecycle.clone());
+        let sleep = pipe.clock.sleep_until(lifecycle.deadline());
+        let (tx, rx) = oneshot_channel();
+        let msg =
+            HandlerMessage::WithContext(Box::new(make(tx)?), CallContext::of(lifecycle.clone()));
+        if !lifecycle.is_live(pipe.clock.now()) {
+            return Err(CdpError::Timeout);
+        }
+        let mut sender = self.sender.clone();
+        let call = std::pin::pin!(async move {
+            sender.send(msg).await?;
+            rx.await?
+        });
+        match select(call, sleep).await {
+            Either::Left((res, _)) => {
+                guard.disarm();
+                res
+            }
+            Either::Right(_) => Err(CdpError::Timeout),
+        }
     }
 
     /// Launches a new instance of `chromium` in the background and attaches to
@@ -234,6 +357,8 @@ impl Browser {
             child: Some(child),
             debug_ws_url,
             browser_context,
+            #[cfg(feature = "pipe-transport")]
+            pipe: None,
         };
 
         Ok((browser, fut))
@@ -249,6 +374,12 @@ impl Browser {
     /// You should wait a few millis if you need to use a page
     /// Returns [TargetInfo]
     pub async fn fetch_targets(&mut self) -> Result<Vec<TargetInfo>> {
+        #[cfg(feature = "pipe-transport")]
+        if let Some(pipe) = &self.pipe {
+            return self
+                .pipe_call(pipe, None, |tx| Ok(HandlerMessage::FetchTargets(tx)))
+                .await;
+        }
         let (tx, rx) = oneshot_channel();
 
         self.sender
@@ -266,6 +397,12 @@ impl Browser {
     /// [`Browser::wait_sync`], [`Browser::try_wait`]).
     /// [`Browser::drop`] waits automatically if needed.
     pub async fn close(&mut self) -> Result<CloseReturns> {
+        #[cfg(feature = "pipe-transport")]
+        if let Some(pipe) = &self.pipe {
+            return self
+                .pipe_call(pipe, None, |tx| Ok(HandlerMessage::CloseBrowser(tx)))
+                .await;
+        }
         let (tx, rx) = oneshot_channel();
 
         self.sender
@@ -388,6 +525,27 @@ impl Browser {
         &self.debug_ws_url
     }
 
+    /// How this browser is reached.
+    #[cfg(feature = "pipe-transport")]
+    pub fn transport(&self) -> Transport {
+        if self.pipe.is_some() {
+            Transport::Pipe
+        } else {
+            Transport::WebSocket
+        }
+    }
+
+    /// The WebSocket endpoint this browser is attached to, if it is attached through one. `None`
+    /// on a pipe, where [`Browser::websocket_address`] is empty: never a URL to reconnect to.
+    #[cfg(feature = "pipe-transport")]
+    pub fn websocket_endpoint(&self) -> Option<&str> {
+        if self.pipe.is_some() {
+            None
+        } else {
+            Some(&self.debug_ws_url)
+        }
+    }
+
     /// Whether the BrowserContext is incognito.
     pub fn is_incognito(&self) -> bool {
         self.is_incognito_configured() || self.browser_context.is_incognito()
@@ -406,6 +564,12 @@ impl Browser {
             if params.browser_context_id.is_none() {
                 params.browser_context_id = Some(id.clone());
             }
+        }
+        #[cfg(feature = "pipe-transport")]
+        if let Some(pipe) = &self.pipe {
+            return self
+                .pipe_call(pipe, None, |tx| Ok(HandlerMessage::CreatePage(params, tx)))
+                .await;
         }
 
         self.sender
@@ -428,6 +592,10 @@ impl Browser {
 
     /// Call a browser method.
     pub async fn execute<T: Command>(&self, cmd: T) -> Result<CommandResponse<T::Response>> {
+        #[cfg(feature = "pipe-transport")]
+        if let Some(pipe) = &self.pipe {
+            return self.pipe_execute(pipe, cmd, None).await;
+        }
         let (tx, rx) = oneshot_channel();
         let method = cmd.identifier();
         let msg = CommandMessage::new(cmd, tx)?;
@@ -437,6 +605,41 @@ impl Browser {
             .send(HandlerMessage::Command(msg))
             .await?;
         let resp = rx.await??;
+        to_command_response::<T>(resp, method)
+    }
+
+    /// [`Browser::execute`] with a budget of `timeout`, capped by the configured request timeout
+    /// and counted from the first poll.
+    #[cfg(feature = "pipe-transport")]
+    pub async fn execute_with_timeout<T: Command>(
+        &self,
+        cmd: T,
+        timeout: std::time::Duration,
+    ) -> Result<CommandResponse<T::Response>> {
+        if let Some(pipe) = &self.pipe {
+            return self.pipe_execute(pipe, cmd, Some(timeout)).await;
+        }
+        // A WebSocket browser: the caller-side bound only.
+        let call = std::pin::pin!(self.execute(cmd));
+        match futures::future::select(call, futures_timer::Delay::new(timeout)).await {
+            futures::future::Either::Left((res, _)) => res,
+            futures::future::Either::Right(_) => Err(CdpError::Timeout),
+        }
+    }
+
+    #[cfg(feature = "pipe-transport")]
+    async fn pipe_execute<T: Command>(
+        &self,
+        pipe: &crate::cmd::lifecycle::PipeContext,
+        cmd: T,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<CommandResponse<T::Response>> {
+        let method = cmd.identifier();
+        let resp = self
+            .pipe_call(pipe, timeout, |tx| {
+                Ok(HandlerMessage::Command(CommandMessage::new(cmd, tx)?))
+            })
+            .await?;
         to_command_response::<T>(resp, method)
     }
 
@@ -455,6 +658,12 @@ impl Browser {
     /// [`Browser::reattach_target`] (screen-play-rs#1041). Detaching a target
     /// with no session only records the intent.
     pub async fn detach_target(&self, target_id: TargetId) -> Result<()> {
+        #[cfg(feature = "pipe-transport")]
+        if let Some(pipe) = &self.pipe {
+            return self
+                .pipe_call(pipe, None, |tx| Ok(HandlerMessage::Detach(target_id, tx)))
+                .await;
+        }
         let (tx, rx) = oneshot_channel();
         self.sender
             .clone()
@@ -469,6 +678,12 @@ impl Browser {
     /// the session is initialized. A target that is attached and initialized
     /// is returned as is (screen-play-rs#1041).
     pub async fn reattach_target(&self, target_id: TargetId) -> Result<Page> {
+        #[cfg(feature = "pipe-transport")]
+        if let Some(pipe) = &self.pipe {
+            return self
+                .pipe_call(pipe, None, |tx| Ok(HandlerMessage::Reattach(target_id, tx)))
+                .await;
+        }
         let (tx, rx) = oneshot_channel();
         self.sender
             .clone()

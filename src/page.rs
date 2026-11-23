@@ -236,6 +236,17 @@ impl Page {
         self.command_future(cmd)?.await
     }
 
+    /// [`Page::execute`] with a budget of `timeout`, capped by the configured request timeout and
+    /// counted from the first poll.
+    #[cfg(feature = "pipe-transport")]
+    pub async fn execute_with_timeout<T: Command>(
+        &self,
+        cmd: T,
+        timeout: std::time::Duration,
+    ) -> Result<CommandResponse<T::Response>> {
+        self.inner.execute_with_timeout(cmd, timeout).await
+    }
+
     /// Execute a command and return the `Command::Response`
     pub fn command_future<T: Command>(&self, cmd: T) -> Result<CommandFuture<T>> {
         self.inner.command_future(cmd)

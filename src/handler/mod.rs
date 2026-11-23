@@ -17,7 +17,7 @@ use chromiumoxide_types::{CallId, Message, Method, Response};
 use chromiumoxide_types::{MethodId, Request as CdpRequest};
 pub(crate) use page::{PageInner, page_channel_error};
 
-use crate::cmd::{CommandMessage, to_command_response};
+use crate::cmd::{CallContext, CommandMessage, to_command_response};
 use crate::conn::Connection;
 use crate::error::{CdpError, Result};
 use crate::handler::browser::BrowserContext;
@@ -50,6 +50,80 @@ pub mod viewport;
 
 #[cfg(test)]
 mod scripted_peer_tests;
+
+/// What reaches the handler after its pipe connection ended (screen-play-rs#1735).
+///
+/// In a running handler that window is a cross-thread race: intake is drained at the start of
+/// each pass, so a message is still buffered at termination only if it arrived after that drain
+/// and before the connection's end was read in the same pass. This test opens the window by
+/// calling `terminate` directly with messages buffered, which is the state that race produces.
+#[cfg(all(test, feature = "pipe-transport"))]
+mod pipe_terminate_tests {
+    use super::*;
+    use crate::cmd::lifecycle::{ManualClock, PipeContext};
+    use crate::conn::pipe::PipeSettings;
+    use crate::error::{PipeClosed, PipeError};
+    use futures::channel::mpsc::channel;
+    use futures::channel::oneshot::channel as oneshot_channel;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn messages_buffered_at_the_end_get_the_connections_reason() {
+        let (conn_w, _peer_r) = tokio::io::duplex(1 << 16);
+        let (_peer_w, conn_r) = tokio::io::duplex(1 << 16);
+        let clock: Arc<dyn crate::cmd::lifecycle::LifecycleClock> = Arc::new(ManualClock::new());
+        let driver = Arc::new(futures::task::AtomicWaker::new());
+        let budget = Duration::from_secs(30);
+        let conn = Connection::<CdpEventMessage>::pipe(
+            conn_r,
+            conn_w,
+            PipeSettings {
+                clock: clock.clone(),
+                default_timeout: budget,
+                driver: driver.clone(),
+            },
+        )
+        .expect("pipe connection");
+        let (mut tx, rx) = channel(8);
+        let ctx = PipeContext {
+            clock,
+            budget,
+            driver,
+        };
+        let mut handler =
+            Handler::new_pipe(conn, rx, HandlerConfig::default(), ctx).expect("pipe handler");
+
+        let (plain_tx, mut plain_rx) = oneshot_channel();
+        tx.try_send(HandlerMessage::FetchTargets(plain_tx))
+            .expect("buffered");
+        let (wrapped_tx, mut wrapped_rx) = oneshot_channel();
+        tx.try_send(HandlerMessage::WithContext(
+            Box::new(HandlerMessage::CloseBrowser(wrapped_tx)),
+            CallContext::default(),
+        ))
+        .expect("buffered");
+
+        handler.terminate(PipeClosed::Malformed);
+
+        let want = PipeError::Closed(PipeClosed::Malformed);
+        match plain_rx.try_recv() {
+            Ok(Some(Err(CdpError::Pipe(got)))) => assert_eq!(got, want),
+            other => panic!("a buffered fetch_targets got {other:?}"),
+        }
+        match wrapped_rx.try_recv() {
+            Ok(Some(Err(CdpError::Pipe(got)))) => assert_eq!(got, want),
+            other => panic!("a buffered close got {other:?}"),
+        }
+        assert!(
+            tx.try_send(HandlerMessage::GetPages(oneshot_channel().0))
+                .is_err(),
+            "the handler takes nothing more after its end"
+        );
+    }
+}
+
+/// How many messages one pass of a pipe handler reads before it yields (and wakes itself).
+const PIPE_READ_BUDGET: usize = 64;
 
 /// The handler that monitors the state of the chromium browser and drives all
 /// the requests and events.
@@ -86,6 +160,12 @@ pub struct Handler {
     event_listeners: EventListeners,
     /// Keeps track is the browser is closing
     closing: bool,
+    /// Set on a pipe connection (screen-play-rs#1735): its clock, budget and driver.
+    #[cfg(feature = "pipe-transport")]
+    pipe: Option<crate::cmd::lifecycle::PipeContext>,
+    /// The pipe connection ended and every waiter was settled: `None` from now on.
+    #[cfg(feature = "pipe-transport")]
+    ended: bool,
 }
 
 impl Handler {
@@ -102,7 +182,36 @@ impl Handler {
             None,
             serde_json::to_value(discover).unwrap(),
         );
+        Self::build(conn, rx, config)
+    }
 
+    /// A handler over a pipe connection. Target discovery is its first command, bounded by the
+    /// configured budget like any other; if it cannot be admitted, construction fails and the
+    /// connection (both endpoints) is dropped.
+    #[cfg(feature = "pipe-transport")]
+    pub(crate) fn new_pipe(
+        mut conn: Connection<CdpEventMessage>,
+        rx: Receiver<HandlerMessage>,
+        config: HandlerConfig,
+        pipe: crate::cmd::lifecycle::PipeContext,
+    ) -> Result<Self> {
+        let discover = SetDiscoverTargetsParams::new(true);
+        conn.submit_command_with(
+            discover.identifier(),
+            None,
+            serde_json::to_value(discover)?,
+            CallContext::of(pipe.start(None)),
+        )?;
+        let mut handler = Self::build(conn, rx, config);
+        handler.pipe = Some(pipe);
+        Ok(handler)
+    }
+
+    fn build(
+        conn: Connection<CdpEventMessage>,
+        rx: Receiver<HandlerMessage>,
+        config: HandlerConfig,
+    ) -> Self {
         let browser_contexts = config
             .context_ids
             .iter()
@@ -124,7 +233,72 @@ impl Handler {
             config,
             event_listeners: Default::default(),
             closing: false,
+            #[cfg(feature = "pipe-transport")]
+            pipe: None,
+            #[cfg(feature = "pipe-transport")]
+            ended: false,
         }
+    }
+
+    /// Whether this handler drives a pipe connection.
+    fn is_pipe(&self) -> bool {
+        #[cfg(feature = "pipe-transport")]
+        {
+            self.pipe.is_some()
+        }
+        #[cfg(not(feature = "pipe-transport"))]
+        {
+            false
+        }
+    }
+
+    /// The handler's notion of now: the pipe connection's clock, so every deadline of a pipe
+    /// connection is in one clock domain; `Instant::now()` otherwise.
+    fn clock_now(&self) -> Instant {
+        #[cfg(feature = "pipe-transport")]
+        if let Some(pipe) = &self.pipe {
+            return pipe.clock.now();
+        }
+        Instant::now()
+    }
+
+    /// A lifecycle for a command the handler issues on its own (target initialization,
+    /// discovery, a refused session's detach): bounded by the configured budget, stamped now.
+    fn internal_ctx(&self) -> CallContext {
+        #[cfg(feature = "pipe-transport")]
+        if let Some(pipe) = &self.pipe {
+            return CallContext::of(pipe.start(None));
+        }
+        CallContext::default()
+    }
+
+    /// `ctx` if it carries a lifecycle, otherwise a handler-owned one.
+    fn ctx_or_internal(&self, ctx: CallContext) -> CallContext {
+        #[cfg(feature = "pipe-transport")]
+        if ctx.lifecycle.is_some() {
+            return ctx;
+        }
+        let _ = ctx;
+        self.internal_ctx()
+    }
+
+    /// Admit a command to the connection. On a pipe a refusal is typed and wrote nothing; on a
+    /// WebSocket this is `Connection::submit_command`.
+    fn submit(
+        &mut self,
+        method: MethodId,
+        session_id: Option<SessionId>,
+        params: serde_json::Value,
+        ctx: CallContext,
+    ) -> Result<CallId> {
+        #[cfg(feature = "pipe-transport")]
+        if self.conn.is_pipe() {
+            return self
+                .conn
+                .submit_command_with(method, session_id, params, ctx);
+        }
+        let _ = ctx;
+        Ok(self.conn.submit_command(method, session_id, params)?)
     }
 
     /// Return the target with the matching `target_id`
@@ -298,6 +472,17 @@ impl Handler {
                     }
                 }
                 PendingRequest::CloseBrowser(tx) => {
+                    // On a pipe, an error answer is the caller's error, and the browser is not
+                    // closing: the connection then ends with `ProtocolError`, as for any CDP
+                    // error answer on a pipe (codex R1 F3 on chromiumoxide#10). The WebSocket
+                    // path keeps its behaviour from before the pipe: any answer counts as closed.
+                    #[cfg(feature = "pipe-transport")]
+                    if self.is_pipe() {
+                        if let Some(err) = resp.error {
+                            let _ = tx.send(Err(CdpError::Chrome(err)));
+                            return;
+                        }
+                    }
                     self.closing = true;
                     let _ = tx.send(Ok(CloseReturns {})).ok();
                 }
@@ -311,14 +496,29 @@ impl Handler {
         msg: CommandMessage,
         now: Instant,
     ) -> Result<()> {
-        let call_id = self
-            .conn
-            .submit_command(msg.method.clone(), msg.session_id, msg.params)?;
-        self.pending_commands.insert(
-            call_id,
-            (PendingRequest::ExternalCommand(msg.sender), msg.method, now),
-        );
-        Ok(())
+        let ctx = msg.call_context();
+        let CommandMessage {
+            method,
+            session_id,
+            params,
+            sender,
+            ..
+        } = msg;
+        match self.submit(method.clone(), session_id, params, ctx) {
+            Ok(call_id) => {
+                self.pending_commands.insert(
+                    call_id,
+                    (PendingRequest::ExternalCommand(sender), method, now),
+                );
+                Ok(())
+            }
+            // A pipe's refusal is routine: the caller gets it, the handler goes on.
+            Err(err) if self.is_pipe() => {
+                let _ = sender.send(Err(err));
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// `attempt`: the attach attempt, for a target's `Target.attachToTarget`.
@@ -328,12 +528,14 @@ impl Handler {
         req: CdpRequest,
         attempt: Option<u64>,
         now: Instant,
+        ctx: CallContext,
     ) -> Result<()> {
         let session = req.session_id.clone();
-        let call_id = self.conn.submit_command(
+        let call_id = self.submit(
             req.method.clone(),
             req.session_id.map(Into::into),
             req.params,
+            ctx,
         )?;
         self.pending_commands.insert(
             call_id,
@@ -346,63 +548,101 @@ impl Handler {
         Ok(())
     }
 
-    fn submit_fetch_targets(&mut self, tx: OneshotSender<Result<Vec<TargetInfo>>>, now: Instant) {
+    fn submit_fetch_targets(
+        &mut self,
+        tx: OneshotSender<Result<Vec<TargetInfo>>>,
+        now: Instant,
+        ctx: CallContext,
+    ) {
         let msg = GetTargetsParams { filter: None };
         let method = msg.identifier();
-        let call_id = self
-            .conn
-            .submit_command(method.clone(), None, serde_json::to_value(msg).unwrap())
-            .unwrap();
-
-        self.pending_commands
-            .insert(call_id, (PendingRequest::GetTargets(tx), method, now));
+        let ctx = self.ctx_or_internal(ctx);
+        let submitted = serde_json::to_value(msg)
+            .map_err(CdpError::from)
+            .and_then(|params| self.submit(method.clone(), None, params, ctx));
+        match submitted {
+            Ok(call_id) => {
+                self.pending_commands
+                    .insert(call_id, (PendingRequest::GetTargets(tx), method, now));
+            }
+            Err(err) => {
+                let _ = tx.send(Err(err));
+            }
+        }
     }
 
     /// Send the Request over to the server and store its identifier to handle
-    /// the response once received.
-    fn submit_navigation(&mut self, id: NavigationId, req: CdpRequest, now: Instant) {
-        let call_id = self
-            .conn
-            .submit_command(
-                req.method.clone(),
-                req.session_id.map(Into::into),
-                req.params,
-            )
-            .unwrap();
-
-        self.pending_commands
-            .insert(call_id, (PendingRequest::Navigate(id), req.method, now));
+    /// the response once received. A refusal completes the navigation with it and releases
+    /// the frame's navigation slot, so the page's next navigation is not queued behind it.
+    fn submit_navigation(
+        &mut self,
+        target: &mut Target,
+        id: NavigationId,
+        req: CdpRequest,
+        now: Instant,
+    ) {
+        let ctx = match self.navigations.get(&id) {
+            Some(NavigationRequest::Navigate(nav)) => nav.ctx.clone(),
+            None => CallContext::default(),
+        };
+        let ctx = self.ctx_or_internal(ctx);
+        match self.submit(
+            req.method.clone(),
+            req.session_id.map(Into::into),
+            req.params,
+            ctx,
+        ) {
+            Ok(call_id) => {
+                self.pending_commands
+                    .insert(call_id, (PendingRequest::Navigate(id), req.method, now));
+            }
+            Err(err) => {
+                target.frame_manager_mut().abort_navigation(id);
+                if let Some(NavigationRequest::Navigate(nav)) = self.navigations.remove(&id) {
+                    let _ = nav.tx.send(Err(err));
+                }
+            }
+        }
     }
 
-    fn submit_close(&mut self, tx: OneshotSender<Result<CloseReturns>>, now: Instant) {
+    fn submit_close(
+        &mut self,
+        tx: OneshotSender<Result<CloseReturns>>,
+        now: Instant,
+        ctx: CallContext,
+    ) {
         let close_msg = CloseParams::default();
         let method = close_msg.identifier();
-
-        let call_id = self
-            .conn
-            .submit_command(
-                method.clone(),
-                None,
-                serde_json::to_value(close_msg).unwrap(),
-            )
-            .unwrap();
-
-        self.pending_commands
-            .insert(call_id, (PendingRequest::CloseBrowser(tx), method, now));
+        let ctx = self.ctx_or_internal(ctx);
+        let submitted = serde_json::to_value(close_msg)
+            .map_err(CdpError::from)
+            .and_then(|params| self.submit(method.clone(), None, params, ctx));
+        match submitted {
+            Ok(call_id) => {
+                self.pending_commands
+                    .insert(call_id, (PendingRequest::CloseBrowser(tx), method, now));
+            }
+            Err(err) => {
+                let _ = tx.send(Err(err));
+            }
+        }
     }
 
     /// Process a message received by the target's page via channel
     fn on_target_message(&mut self, target: &mut Target, msg: CommandMessage, now: Instant) {
         // if let some
         if msg.is_navigation() {
+            let ctx = msg.call_context();
             let (req, tx) = msg.split();
             let id = self.next_navigation_id();
             target.goto(FrameNavigationRequest::new(id, req));
             self.navigations.insert(
                 id,
-                NavigationRequest::Navigate(NavigationInProgress::new(tx)),
+                NavigationRequest::Navigate(NavigationInProgress::new(tx, ctx)),
             );
         } else {
+            // A refusal reaches the command's own caller inside; only a WebSocket serialization
+            // failure comes back here, and it never did (unchanged).
             let _ = self.submit_external_command(msg, now);
         }
     }
@@ -424,20 +664,25 @@ impl Handler {
     /// `CreateTargetParams` has finished loading (The `Target`'s `Page` is
     /// ready and idle), the `Target` sends its newly created `Page` as response
     /// to the initiator (`tx`) of the `CreateTargetParams` request.
-    fn create_page(&mut self, params: CreateTargetParams, tx: OneshotSender<Result<Page>>) {
+    fn create_page(
+        &mut self,
+        params: CreateTargetParams,
+        tx: OneshotSender<Result<Page>>,
+        ctx: CallContext,
+    ) {
         match url::Url::parse(&params.url) {
             Ok(_) => {
                 let method = params.identifier();
+                let ctx = self.ctx_or_internal(ctx);
                 match serde_json::to_value(params) {
-                    Ok(params) => match self.conn.submit_command(method.clone(), None, params) {
+                    Ok(params) => match self.submit(method.clone(), None, params, ctx) {
                         Ok(call_id) => {
-                            self.pending_commands.insert(
-                                call_id,
-                                (PendingRequest::CreateTarget(tx), method, Instant::now()),
-                            );
+                            let now = self.clock_now();
+                            self.pending_commands
+                                .insert(call_id, (PendingRequest::CreateTarget(tx), method, now));
                         }
                         Err(err) => {
-                            let _ = tx.send(Err(err.into())).ok();
+                            let _ = tx.send(Err(err)).ok();
                         }
                     },
                     Err(err) => {
@@ -533,11 +778,12 @@ impl Handler {
         // starts the same in-place re-attach a lost session starts (rationed
         // by the recovery budget); a target detached on purpose
         // (`Browser::detach_target`) is left alone.
+        let now = self.clock_now();
         if let Some(existing) = self.targets.get_mut(&event.target_info.target_id) {
             // Do not let its metadata freeze at the first snapshot — this
             // crate does not handle `Target.targetInfoChanged`, so discovery
             // is the only refresh.
-            existing.on_rediscovered(&event.target_info, Instant::now());
+            existing.on_rediscovered(&event.target_info, now);
             return;
         }
         let browser_ctx = event
@@ -547,7 +793,8 @@ impl Handler {
             .map(BrowserContext::from)
             .filter(|id| self.browser_contexts.contains(id))
             .unwrap_or_else(|| self.default_browser_context.clone());
-        let target = Target::new(
+        #[allow(unused_mut)]
+        let mut target = Target::new(
             event.target_info,
             TargetConfig {
                 ignore_https_errors: self.config.ignore_https_errors,
@@ -560,6 +807,10 @@ impl Handler {
             },
             browser_ctx,
         );
+        #[cfg(feature = "pipe-transport")]
+        if let Some(pipe) = &self.pipe {
+            target.set_pipe_context(pipe.clone());
+        }
         // Only schedule an ID that is not scheduled yet. Reaching here for a
         // target that already has an entry means the revival path above fell
         // through, and that entry's ID is already in `target_ids` — pushing
@@ -624,7 +875,9 @@ impl Handler {
                 .session_id(session.session_id().clone())
                 .build();
             let target_id = session.target_id().clone();
-            let _ = self.submit_internal_command(
+            let now = self.clock_now();
+            let ctx = self.internal_ctx();
+            if let Err(err) = self.submit_internal_command(
                 target_id,
                 CdpRequest {
                     method: params.identifier(),
@@ -632,8 +885,12 @@ impl Handler {
                     params: serde_json::to_value(params).unwrap(),
                 },
                 None,
-                Instant::now(),
-            );
+                now,
+                ctx,
+            ) {
+                // Nothing waits on this cleanup; the stray session stays until the peer ends it.
+                tracing::debug!(%err, "detach of a refused session was not sent");
+            }
         }
         self.sessions.insert(event.session_id, session);
     }
@@ -676,7 +933,8 @@ impl Handler {
             .map(BrowserContext::from)
             .filter(|id| self.browser_contexts.contains(id))
             .unwrap_or_else(|| self.default_browser_context.clone());
-        let target = Target::new_child(
+        #[allow(unused_mut)]
+        let mut target = Target::new_child(
             event.target_info,
             TargetConfig {
                 ignore_https_errors: self.config.ignore_https_errors,
@@ -692,6 +950,10 @@ impl Handler {
             browser_ctx,
             event.session_id.clone(),
         );
+        #[cfg(feature = "pipe-transport")]
+        if let Some(pipe) = &self.pipe {
+            target.set_pipe_context(pipe.clone());
+        }
         if !self.target_ids.contains(&target_id) {
             self.target_ids.push(target_id.clone());
         }
@@ -726,6 +988,7 @@ impl Handler {
     /// Can be issued multiple times per target if multiple session have been
     /// attached to it.
     fn on_detached_from_target(&mut self, event: EventDetachedFromTarget) {
+        let now = self.clock_now();
         // remove the session
         if let Some(session) = self.sessions.remove(&event.session_id) {
             if let Some(target) = self.targets.get_mut(session.target_id()) {
@@ -742,7 +1005,7 @@ impl Handler {
                     // screen-play-rs#1041: the target decides what follows —
                     // re-attach in place if it should stay attached, stay
                     // detached if it was detached on purpose.
-                    target.on_session_lost(Instant::now());
+                    target.on_session_lost(now);
                     // Also drop the cached PageHandle so any caller
                     // that races a `Target.attachToTarget` reply against
                     // the matching `attachedToTarget` event window —
@@ -778,7 +1041,14 @@ impl Handler {
     /// Record that `target_id` should stay detached and end its session on the
     /// browser's own session (screen-play-rs#1041). Answers `tx` when Chrome
     /// does; a target without a session is answered at once.
-    fn detach_target(&mut self, target_id: TargetId, tx: OneshotSender<Result<()>>, now: Instant) {
+    fn detach_target(
+        &mut self,
+        target_id: TargetId,
+        tx: OneshotSender<Result<()>>,
+        now: Instant,
+        ctx: CallContext,
+    ) {
+        let ctx = self.ctx_or_internal(ctx);
         let Some(target) = self.targets.get_mut(&target_id) else {
             let _ = tx.send(Ok(()));
             return;
@@ -791,10 +1061,12 @@ impl Handler {
             .session_id(session.clone())
             .build();
         let method = params.identifier();
-        match self
-            .conn
-            .submit_command(method.clone(), None, serde_json::to_value(params).unwrap())
-        {
+        match self.submit(
+            method.clone(),
+            None,
+            serde_json::to_value(params).unwrap(),
+            ctx,
+        ) {
             Ok(call_id) => {
                 self.pending_commands.insert(
                     call_id,
@@ -812,7 +1084,7 @@ impl Handler {
             }
             Err(err) => {
                 self.on_detach_failed(&target_id, session.as_ref(), decision);
-                let _ = tx.send(Err(err.into()));
+                let _ = tx.send(Err(err));
             }
         }
     }
@@ -840,52 +1112,247 @@ impl Handler {
             .collect::<Vec<_>>();
         for call in timed_out {
             if let Some((req, _, _)) = self.pending_commands.remove(&call) {
-                match req {
-                    PendingRequest::CreateTarget(tx) => {
-                        let _ = tx.send(Err(CdpError::Timeout));
-                    }
-                    PendingRequest::GetTargets(tx) => {
-                        let _ = tx.send(Err(CdpError::Timeout));
-                    }
-                    PendingRequest::Navigate(nav) => {
-                        if let Some(nav) = self.navigations.remove(&nav) {
-                            match nav {
-                                NavigationRequest::Navigate(nav) => {
-                                    let _ = nav.tx.send(Err(CdpError::Timeout));
-                                }
-                            }
-                        }
-                    }
-                    PendingRequest::ExternalCommand(tx) => {
-                        let _ = tx.send(Err(CdpError::Timeout));
-                    }
-                    PendingRequest::Detach(target_id, session, decision, tx) => {
-                        // A restarted initialization needs a poll, which an
-                        // idle connection would not bring (codex R10).
-                        if self.on_detach_failed(&target_id, &session, decision) {
-                            marked = true;
-                        }
-                        let _ = tx.send(Err(CdpError::Timeout));
-                    }
-                    PendingRequest::InternalCommand(target_id, _, Some(attempt)) => {
-                        // An attach that never answered leaves no session to
-                        // time out on; tell the target, or it counts as
-                        // attaching forever (screen-play-rs#1041, codex R3) —
-                        // unless a newer attempt replaced it (codex R4).
-                        if let Some(target) = self.targets.get_mut(&target_id) {
-                            if target.on_attach_timed_out(attempt) {
-                                marked = true;
-                            }
-                        }
-                    }
-                    PendingRequest::InternalCommand(..) => {}
-                    PendingRequest::CloseBrowser(tx) => {
-                        let _ = tx.send(Err(CdpError::Timeout));
-                    }
+                if self.fail_request(req, || CdpError::Timeout) {
+                    marked = true;
                 }
             }
         }
         marked
+    }
+
+    /// Settle a request that will get no answer with `err`. Returns whether a target must be
+    /// polled again to act on it.
+    fn fail_request(&mut self, req: PendingRequest, err: impl Fn() -> CdpError) -> bool {
+        let mut marked = false;
+        match req {
+            PendingRequest::CreateTarget(tx) => {
+                let _ = tx.send(Err(err()));
+            }
+            PendingRequest::GetTargets(tx) => {
+                let _ = tx.send(Err(err()));
+            }
+            PendingRequest::Navigate(nav) => {
+                if let Some(nav) = self.navigations.remove(&nav) {
+                    match nav {
+                        NavigationRequest::Navigate(nav) => {
+                            let _ = nav.tx.send(Err(err()));
+                        }
+                    }
+                }
+            }
+            PendingRequest::ExternalCommand(tx) => {
+                let _ = tx.send(Err(err()));
+            }
+            PendingRequest::Detach(target_id, session, decision, tx) => {
+                // A restarted initialization needs a poll, which an
+                // idle connection would not bring (codex R10).
+                if self.on_detach_failed(&target_id, &session, decision) {
+                    marked = true;
+                }
+                let _ = tx.send(Err(err()));
+            }
+            PendingRequest::InternalCommand(target_id, _, Some(attempt)) => {
+                // An attach that never answered leaves no session to
+                // time out on; tell the target, or it counts as
+                // attaching forever (screen-play-rs#1041, codex R3) —
+                // unless a newer attempt replaced it (codex R4).
+                if let Some(target) = self.targets.get_mut(&target_id) {
+                    if target.on_attach_timed_out(attempt) {
+                        marked = true;
+                    }
+                }
+            }
+            PendingRequest::InternalCommand(..) => {}
+            PendingRequest::CloseBrowser(tx) => {
+                let _ = tx.send(Err(err()));
+            }
+        }
+        marked
+    }
+
+    /// Settle what a pipe connection dropped unsent, and navigations whose caller's lifecycle
+    /// ended. Returns whether anything changed that needs another pass.
+    #[cfg(feature = "pipe-transport")]
+    fn sweep_pipe(&mut self, now: Instant) -> bool {
+        let mut marked = false;
+        for call in self.conn.take_retired() {
+            if let Some((req, _, _)) = self.pending_commands.remove(&call) {
+                self.fail_request(req, || CdpError::Timeout);
+                marked = true;
+            }
+        }
+        let dead: Vec<NavigationId> = self
+            .navigations
+            .iter()
+            .filter(|(_, nav)| match nav {
+                NavigationRequest::Navigate(nav) => nav
+                    .ctx
+                    .lifecycle
+                    .as_ref()
+                    .is_some_and(|lc| !lc.is_live(now)),
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in dead {
+            for target in self.targets.values_mut() {
+                target.frame_manager_mut().abort_navigation(id);
+            }
+            if let Some(NavigationRequest::Navigate(nav)) = self.navigations.remove(&id) {
+                let _ = nav.tx.send(Err(CdpError::Timeout));
+            }
+            marked = true;
+        }
+        marked
+    }
+
+    /// The pipe connection ended for `reason`: every waiter is settled now, exactly once —
+    /// commands, navigations, page creations, re-attaches, and messages still queued for the
+    /// handler — and the handler yields `None` from now on.
+    #[cfg(feature = "pipe-transport")]
+    fn terminate(&mut self, reason: crate::error::PipeClosed) {
+        let err = move || CdpError::Pipe(crate::error::PipeError::Closed(reason));
+        // Dropped unsent before the end: those ran out of time or were cancelled.
+        for call in self.conn.take_retired() {
+            if let Some((req, _, _)) = self.pending_commands.remove(&call) {
+                self.fail_request(req, || CdpError::Timeout);
+            }
+        }
+        let pending: Vec<PendingRequest> = self
+            .pending_commands
+            .drain()
+            .map(|(_, (req, _, _))| req)
+            .collect();
+        for req in pending {
+            self.fail_request(req, err);
+        }
+        for (_, nav) in self.navigations.drain() {
+            match nav {
+                NavigationRequest::Navigate(nav) => {
+                    let _ = nav.tx.send(Err(err()));
+                }
+            }
+        }
+        for target in self.targets.values_mut() {
+            target.fail_waiters(err);
+        }
+        self.targets.clear();
+        self.target_ids.clear();
+        self.sessions.clear();
+        let rx = self.from_browser.get_mut();
+        rx.close();
+        // `try_next`, not `try_recv`: the manifest allows any futures 0.3, and `try_recv` only
+        // exists from futures-channel 0.3.32 on; `try_next` exists in every 0.3 release.
+        #[allow(deprecated)]
+        while let Ok(Some(msg)) = rx.try_next() {
+            Self::refuse(msg, &err);
+        }
+        self.ended = true;
+    }
+
+    /// Answer a message that reached a handler whose pipe connection ended.
+    #[cfg(feature = "pipe-transport")]
+    fn refuse(msg: HandlerMessage, err: &impl Fn() -> CdpError) {
+        match msg {
+            HandlerMessage::Command(cmd) => {
+                let _ = cmd.sender.send(Err(err()));
+            }
+            HandlerMessage::FetchTargets(tx) => {
+                let _ = tx.send(Err(err()));
+            }
+            HandlerMessage::CloseBrowser(tx) => {
+                let _ = tx.send(Err(err()));
+            }
+            HandlerMessage::CreatePage(_, tx) => {
+                let _ = tx.send(Err(err()));
+            }
+            HandlerMessage::GetPages(tx) => {
+                let _ = tx.send(Vec::new());
+            }
+            HandlerMessage::GetPage(_, tx) => {
+                let _ = tx.send(None);
+            }
+            HandlerMessage::Detach(_, tx) => {
+                let _ = tx.send(Err(err()));
+            }
+            HandlerMessage::Reattach(_, tx) => {
+                let _ = tx.send(Err(err()));
+            }
+            HandlerMessage::WithContext(inner, _) => Self::refuse(*inner, err),
+            HandlerMessage::InsertContext(_)
+            | HandlerMessage::DisposeContext(_)
+            | HandlerMessage::AddEventListener(_) => {}
+        }
+    }
+
+    /// One message from the `Browser` (or a `Page`), with the lifecycle its caller stamped, if
+    /// any.
+    fn on_browser_message(
+        &mut self,
+        msg: HandlerMessage,
+        now: Instant,
+        ctx: CallContext,
+    ) -> Result<()> {
+        match msg {
+            HandlerMessage::Command(cmd) => {
+                #[cfg(feature = "pipe-transport")]
+                let cmd = if ctx.lifecycle.is_some() {
+                    cmd.with_context(ctx.clone())
+                } else {
+                    cmd
+                };
+                self.submit_external_command(cmd, now)?;
+            }
+            HandlerMessage::FetchTargets(tx) => {
+                self.submit_fetch_targets(tx, now, ctx);
+            }
+            HandlerMessage::CloseBrowser(tx) => {
+                self.submit_close(tx, now, ctx);
+            }
+            HandlerMessage::CreatePage(params, tx) => {
+                self.create_page(params, tx, ctx);
+            }
+            HandlerMessage::GetPages(tx) => {
+                let pages: Vec<_> = self
+                    .targets
+                    .values_mut()
+                    .filter(|p| p.is_page())
+                    .filter_map(|target| target.get_or_create_page())
+                    .map(|page| Page::from(page.clone()))
+                    .collect();
+                let _ = tx.send(pages);
+            }
+            HandlerMessage::InsertContext(ctx) => {
+                self.browser_contexts.insert(ctx);
+            }
+            HandlerMessage::DisposeContext(ctx) => {
+                self.browser_contexts.remove(&ctx);
+            }
+            HandlerMessage::GetPage(target_id, tx) => {
+                let page = self
+                    .targets
+                    .get_mut(&target_id)
+                    .and_then(|target| target.get_or_create_page())
+                    .map(|page| Page::from(page.clone()));
+                let _ = tx.send(page);
+            }
+            HandlerMessage::Detach(target_id, tx) => {
+                self.detach_target(target_id, tx, now, ctx);
+            }
+            HandlerMessage::Reattach(target_id, tx) => match self.targets.get_mut(&target_id) {
+                Some(target) => target.reattach_with(now, tx, ctx),
+                None => {
+                    let _ = tx.send(Err(CdpError::NotFound));
+                }
+            },
+            HandlerMessage::AddEventListener(req) => {
+                self.event_listeners.add_listener(req);
+            }
+            #[cfg(feature = "pipe-transport")]
+            HandlerMessage::WithContext(inner, ctx) => {
+                return self.on_browser_message(*inner, now, ctx);
+            }
+        }
+        Ok(())
     }
 
     pub fn event_listeners_mut(&mut self) -> &mut EventListeners {
@@ -899,64 +1366,20 @@ impl Stream for Handler {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let pin = self.get_mut();
 
+        #[cfg(feature = "pipe-transport")]
+        if pin.ended {
+            // A terminal pipe connection: its one error (if any) was returned, every waiter was
+            // settled, and nothing can ever arrive again.
+            return Poll::Ready(None);
+        }
+
         loop {
-            let now = Instant::now();
+            let now = pin.clock_now();
             // temporary pinning of the browser receiver should be safe as we are pinning
             // through the already pinned self. with the receivers we can also
             // safely ignore exhaustion as those are fused.
             while let Poll::Ready(Some(msg)) = Pin::new(&mut pin.from_browser).poll_next(cx) {
-                match msg {
-                    HandlerMessage::Command(cmd) => {
-                        pin.submit_external_command(cmd, now)?;
-                    }
-                    HandlerMessage::FetchTargets(tx) => {
-                        pin.submit_fetch_targets(tx, now);
-                    }
-                    HandlerMessage::CloseBrowser(tx) => {
-                        pin.submit_close(tx, now);
-                    }
-                    HandlerMessage::CreatePage(params, tx) => {
-                        pin.create_page(params, tx);
-                    }
-                    HandlerMessage::GetPages(tx) => {
-                        let pages: Vec<_> = pin
-                            .targets
-                            .values_mut()
-                            .filter(|p| p.is_page())
-                            .filter_map(|target| target.get_or_create_page())
-                            .map(|page| Page::from(page.clone()))
-                            .collect();
-                        let _ = tx.send(pages);
-                    }
-                    HandlerMessage::InsertContext(ctx) => {
-                        pin.browser_contexts.insert(ctx);
-                    }
-                    HandlerMessage::DisposeContext(ctx) => {
-                        pin.browser_contexts.remove(&ctx);
-                    }
-                    HandlerMessage::GetPage(target_id, tx) => {
-                        let page = pin
-                            .targets
-                            .get_mut(&target_id)
-                            .and_then(|target| target.get_or_create_page())
-                            .map(|page| Page::from(page.clone()));
-                        let _ = tx.send(page);
-                    }
-                    HandlerMessage::Detach(target_id, tx) => {
-                        pin.detach_target(target_id, tx, now);
-                    }
-                    HandlerMessage::Reattach(target_id, tx) => {
-                        match pin.targets.get_mut(&target_id) {
-                            Some(target) => target.reattach(now, tx),
-                            None => {
-                                let _ = tx.send(Err(CdpError::NotFound));
-                            }
-                        }
-                    }
-                    HandlerMessage::AddEventListener(req) => {
-                        pin.event_listeners.add_listener(req);
-                    }
-                }
+                pin.on_browser_message(msg, now, CallContext::default())?;
             }
 
             for n in (0..pin.target_ids.len()).rev() {
@@ -965,26 +1388,48 @@ impl Stream for Handler {
                     while let Some(event) = target.poll(cx, now) {
                         match event {
                             TargetEvent::Request(req) => {
-                                let _ = pin.submit_internal_command(
+                                let method = req.method.clone();
+                                let ctx = pin.internal_ctx();
+                                if let Err(err) = pin.submit_internal_command(
                                     target.target_id().clone(),
                                     req,
                                     None,
                                     now,
-                                );
+                                    ctx,
+                                ) {
+                                    // Refused before any byte was written: the target's
+                                    // initialization fails now instead of waiting for an answer
+                                    // that cannot come.
+                                    if pin.is_pipe() {
+                                        target.on_internal_refused(&method, &err);
+                                    }
+                                }
                             }
                             TargetEvent::Attach(req, attempt) => {
-                                let _ = pin.submit_internal_command(
-                                    target.target_id().clone(),
-                                    req,
-                                    Some(attempt),
-                                    now,
-                                );
+                                // A re-attaching caller's lifecycle bounds its attach.
+                                let ctx = target.take_attach_context();
+                                let ctx = pin.ctx_or_internal(ctx);
+                                if pin
+                                    .submit_internal_command(
+                                        target.target_id().clone(),
+                                        req,
+                                        Some(attempt),
+                                        now,
+                                        ctx,
+                                    )
+                                    .is_err()
+                                    && pin.is_pipe()
+                                {
+                                    // As if it timed out: the target gives up this attempt and
+                                    // answers its waiter.
+                                    target.on_attach_timed_out(attempt);
+                                }
                             }
                             TargetEvent::Command(msg) => {
                                 pin.on_target_message(&mut target, msg, now);
                             }
                             TargetEvent::NavigationRequest(id, req) => {
-                                pin.submit_navigation(id, req, now);
+                                pin.submit_navigation(&mut target, id, req, now);
                             }
                             TargetEvent::NavigationResult(res) => {
                                 pin.on_navigation_lifecycle_completed(res)
@@ -1010,8 +1455,17 @@ impl Stream for Handler {
             }
 
             let mut done = true;
+            // On a pipe, how many messages this pass may still read before yielding, so a flood
+            // of events cannot keep the task from its sweeps (and other tasks) forever.
+            let mut read_budget = PIPE_READ_BUDGET;
 
             loop {
+                if pin.is_pipe() {
+                    if read_budget == 0 {
+                        break;
+                    }
+                    read_budget -= 1;
+                }
                 let ev = match Pin::new(&mut pin.conn).poll_next(cx) {
                     Poll::Ready(Some(ev)) => ev,
                     // The connection ended (the peer closed the socket, or it dropped after an
@@ -1022,6 +1476,10 @@ impl Stream for Handler {
                     // eviction timer still woke it, but nothing could end it (winclaw#2121, U-3
                     // fix 2).
                     Poll::Ready(None) => {
+                        #[cfg(feature = "pipe-transport")]
+                        if pin.is_pipe() {
+                            pin.terminate(crate::error::PipeClosed::Eof);
+                        }
                         // Deliver what was read before the end, e.g. a page's ending events.
                         pin.event_listeners_mut().poll(cx);
                         return Poll::Ready(None);
@@ -1032,12 +1490,42 @@ impl Stream for Handler {
                     Ok(Message::Response(resp)) => {
                         pin.on_response(resp);
                         if pin.closing {
+                            #[cfg(feature = "pipe-transport")]
+                            if pin.is_pipe() {
+                                // End the connection itself before reporting the end: `terminate`
+                                // settles the handler's waiters but leaves the endpoints alone,
+                                // and the fuse it sets stops the connection from being polled
+                                // again, so without this both pipe ends stayed open until the
+                                // handler was dropped (codex R1 F2 on chromiumoxide#10).
+                                let reason = pin.conn.end_pipe(crate::error::PipeClosed::Eof);
+                                pin.terminate(reason);
+                                if reason != crate::error::PipeClosed::Eof {
+                                    tracing::error!("pipe connection ended: {:?}", reason);
+                                    return Poll::Ready(Some(Err(CdpError::Pipe(
+                                        crate::error::PipeError::Closed(reason),
+                                    ))));
+                                }
+                            }
                             // handler should stop processing
                             return Poll::Ready(None);
                         }
                     }
                     Ok(Message::Event(ev)) => {
                         pin.on_event(ev);
+                    }
+                    #[cfg(feature = "pipe-transport")]
+                    Err(CdpError::Pipe(crate::error::PipeError::Closed(reason))) => {
+                        // A pipe connection is terminal: settle every waiter once, then end. A
+                        // clean end of input is an end, not an error.
+                        pin.terminate(reason);
+                        pin.event_listeners_mut().poll(cx);
+                        if reason == crate::error::PipeClosed::Eof {
+                            return Poll::Ready(None);
+                        }
+                        tracing::error!("pipe connection ended: {:?}", reason);
+                        return Poll::Ready(Some(Err(CdpError::Pipe(
+                            crate::error::PipeError::Closed(reason),
+                        ))));
                     }
                     Err(err @ CdpError::InvalidMessage(_, _)) => {
                         if pin.config.ignore_invalid_messages {
@@ -1073,7 +1561,20 @@ impl Stream for Handler {
             // delivered this pass.
             pin.event_listeners_mut().poll(cx);
 
-            if pin.evict_command_timeout.poll_ready(cx) {
+            if pin.is_pipe() {
+                // A pipe command's deadline is its caller's lifecycle, checked by the connection
+                // on every poll; what the connection dropped unsent is settled here, and so is a
+                // navigation whose caller stopped waiting or ran out of time.
+                #[cfg(feature = "pipe-transport")]
+                if pin.sweep_pipe(now) {
+                    done = false;
+                }
+                if read_budget == 0 {
+                    // Yielded with input possibly left: come back right away.
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+            } else if pin.evict_command_timeout.poll_ready(cx) {
                 // evict all commands that timed out; a target told its attach
                 // timed out is polled again now, not at the next unrelated
                 // wakeup (screen-play-rs#1041, codex R4)
@@ -1144,14 +1645,17 @@ pub struct NavigationInProgress<T> {
     response: Option<Response>,
     /// Sender who initiated the navigation request
     tx: OneshotSender<T>,
+    /// The initiating caller's lifecycle on a pipe connection; empty otherwise.
+    ctx: CallContext,
 }
 
 impl<T> NavigationInProgress<T> {
-    fn new(tx: OneshotSender<T>) -> Self {
+    fn new(tx: OneshotSender<T>, ctx: CallContext) -> Self {
         Self {
             navigated: false,
             response: None,
             tx,
+            ctx,
         }
     }
 
@@ -1227,4 +1731,8 @@ pub(crate) enum HandlerMessage {
     Reattach(TargetId, OneshotSender<Result<Page>>),
     AddEventListener(EventListenerRequest),
     CloseBrowser(OneshotSender<Result<CloseReturns>>),
+    /// A message whose command(s) carry its caller's lifecycle on a pipe connection
+    /// (screen-play-rs#1735): stamped at the first poll of the API future, not at receipt here.
+    #[cfg(feature = "pipe-transport")]
+    WithContext(Box<HandlerMessage>, CallContext),
 }
