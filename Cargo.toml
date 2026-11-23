@@ -49,12 +49,15 @@ quote = "1"
 proc-macro2 = "1"
 chrono = "0.4.1"
 tracing-subscriber = "0.3"
-tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "net", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "net", "sync", "io-util"] }
 
 [features]
 default = ["bytes"]
 fetcher = ["chromiumoxide_fetcher"]
 bytes = ["dep:bytes"]
+# A CDP connection over an owned byte pipe instead of a WebSocket (screen-play-rs#1735, B1).
+# Default off: it adds `Browser::connect_pipe` and nothing selects it.
+pipe-transport = []
 
 rustls = ["chromiumoxide_fetcher/rustls"]
 native-tls = ["chromiumoxide_fetcher/native-tls"]
@@ -70,6 +73,12 @@ required-features = ["fetcher", "zip8", "rustls"]
 name = "chromiumoxide_tests"
 path = "tests/lib.rs"
 harness = true
+
+[[test]]
+name = "pipe_handler"
+path = "tests/pipe_handler.rs"
+harness = true
+required-features = ["pipe-transport"]
 
 [workspace]
 members = [

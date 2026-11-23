@@ -16,6 +16,9 @@ use chromiumoxide_types::{CallId, EventMessage, Message, MethodCall, MethodId};
 use crate::error::CdpError;
 use crate::error::Result;
 
+#[cfg(feature = "pipe-transport")]
+pub mod pipe;
+
 /// Exchanges the messages with the websocket
 #[must_use = "streams do nothing unless polled"]
 #[derive(Debug)]

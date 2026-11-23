@@ -68,6 +68,37 @@ impl PageLookup {
     }
 }
 
+/// How a [`Browser`] reaches its browser.
+#[cfg(feature = "pipe-transport")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// A DevTools WebSocket (`Browser::connect`, `Browser::launch`).
+    WebSocket,
+    /// An owned byte pipe ([`Browser::connect_pipe`]): no URL, no listener, no network endpoint.
+    Pipe,
+}
+
+/// How [`Browser::connect_pipe`] builds its handler.
+#[cfg(feature = "pipe-transport")]
+#[derive(Debug, Clone)]
+pub struct PipeConfig {
+    /// The handler's configuration. Its `request_timeout` is the budget every command gets,
+    /// counted from the first poll of the call that makes it.
+    pub handler: HandlerConfig,
+    /// The clock deadlines are stamped and checked with.
+    pub clock: std::sync::Arc<dyn crate::cmd::lifecycle::LifecycleClock>,
+}
+
+#[cfg(feature = "pipe-transport")]
+impl Default for PipeConfig {
+    fn default() -> Self {
+        Self {
+            handler: HandlerConfig::default(),
+            clock: std::sync::Arc::new(crate::cmd::lifecycle::SystemClock),
+        }
+    }
+}
+
 /// Browser connection information.
 #[derive(serde::Deserialize, Debug, Default)]
 pub struct BrowserConnection {
@@ -159,6 +190,19 @@ impl Browser {
             browser_context,
         };
         Ok((browser, fut))
+    }
+
+    /// Drive a browser over an owned byte pipe: CDP messages delimited by NUL, as Chrome's
+    /// `--remote-debugging-pipe` speaks it. `reader` gives the browser's output, `writer` takes
+    /// its input. Nothing is resolved, listened on or launched, and nothing falls back to a
+    /// network endpoint.
+    #[cfg(feature = "pipe-transport")]
+    pub fn connect_pipe<R, W>(_reader: R, _writer: W, _config: PipeConfig) -> Result<(Self, Handler)>
+    where
+        R: tokio::io::AsyncRead + Send + Unpin + 'static,
+        W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        Err(CdpError::msg("pipe transport: not implemented"))
     }
 
     /// Launches a new instance of `chromium` in the background and attaches to
@@ -388,6 +432,18 @@ impl Browser {
         &self.debug_ws_url
     }
 
+    /// How this browser is reached.
+    #[cfg(feature = "pipe-transport")]
+    pub fn transport(&self) -> Transport {
+        Transport::WebSocket
+    }
+
+    /// The WebSocket endpoint this browser is attached to, if it is attached through one.
+    #[cfg(feature = "pipe-transport")]
+    pub fn websocket_endpoint(&self) -> Option<&str> {
+        Some(&self.debug_ws_url)
+    }
+
     /// Whether the BrowserContext is incognito.
     pub fn is_incognito(&self) -> bool {
         self.is_incognito_configured() || self.browser_context.is_incognito()
@@ -438,6 +494,17 @@ impl Browser {
             .await?;
         let resp = rx.await??;
         to_command_response::<T>(resp, method)
+    }
+
+    /// [`Browser::execute`] with a budget of `timeout`, capped by the configured request timeout
+    /// and counted from the first poll.
+    #[cfg(feature = "pipe-transport")]
+    pub async fn execute_with_timeout<T: Command>(
+        &self,
+        _cmd: T,
+        _timeout: std::time::Duration,
+    ) -> Result<CommandResponse<T::Response>> {
+        Err(CdpError::msg("pipe transport: not implemented"))
     }
 
     /// Return all of the pages of the browser

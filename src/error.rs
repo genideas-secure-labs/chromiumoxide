@@ -66,6 +66,10 @@ pub enum CdpError {
     Url(#[from] url::ParseError),
     #[error("{1}")]
     InvalidMessage(String, serde_json::Error),
+    /// A pipe connection refused a command or has ended (screen-play-rs#1735).
+    #[cfg(feature = "pipe-transport")]
+    #[error("{0}")]
+    Pipe(#[from] PipeError),
 }
 impl CdpError {
     pub fn msg(msg: impl Into<String>) -> Self {
@@ -84,6 +88,77 @@ pub enum ChannelError {
     /// reached a target, or was dropped before it was answered.
     #[error("page closed: its target ended, its session detached, or the handler stopped")]
     PageClosed,
+}
+
+/// Why a pipe connection refused a command, or why it ended.
+///
+/// A refusal ([`PipeError::QueueFull`] .. [`PipeError::IdsExhausted`]) wrote zero bytes of that
+/// command and leaves the connection usable. [`PipeError::Closed`] means the connection is over:
+/// its endpoints are closed and nothing more is sent on it.
+#[cfg(feature = "pipe-transport")]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum PipeError {
+    /// The connection already holds its maximum of admitted commands.
+    #[error("pipe admission refused: {0} commands already admitted")]
+    QueueFull(usize),
+    /// The serialized command is larger than one pipe frame may be.
+    #[error("pipe admission refused: a {len}-byte frame exceeds the {max}-byte limit")]
+    FrameTooLarge { len: usize, max: usize },
+    /// The command's deadline passed before any byte of it was written.
+    #[error("pipe command expired before it was sent")]
+    ExpiredBeforeSend,
+    /// The command's caller stopped waiting before any byte of it was written.
+    #[error("pipe command cancelled before it was sent")]
+    CancelledBeforeSend,
+    /// No command id is left that was never used on this connection.
+    #[error("pipe admission refused: command ids exhausted")]
+    IdsExhausted,
+    /// The connection has ended.
+    #[error("pipe connection closed: {0}")]
+    Closed(PipeClosed),
+}
+
+/// Why a pipe connection ended. Every reason closes both endpoints and fails all pending work; no
+/// command is retried.
+#[cfg(feature = "pipe-transport")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum PipeClosed {
+    /// The peer closed its end between frames.
+    #[error("end of stream")]
+    Eof,
+    /// The peer closed its end inside a frame.
+    #[error("end of stream inside a frame")]
+    Truncated,
+    /// An incoming frame was empty or not a CDP message.
+    #[error("malformed frame")]
+    Malformed,
+    /// An incoming frame grew past the frame limit.
+    #[error("incoming frame exceeds the frame limit")]
+    Oversized,
+    /// A response answered no command awaiting one.
+    #[error("unexpected response")]
+    UnexpectedResponse,
+    /// Reading failed.
+    #[error("read failed: {0}")]
+    Read(std::io::ErrorKind),
+    /// Writing failed.
+    #[error("write failed: {0}")]
+    Write(std::io::ErrorKind),
+    /// Flushing failed.
+    #[error("flush failed: {0}")]
+    Flush(std::io::ErrorKind),
+    /// A command whose bytes were (partly) sent passed its deadline before its answer: what it
+    /// did is unknown.
+    #[error("a sent command expired; its effect is unknown")]
+    ActiveExpired,
+    /// The caller of a command whose bytes were (partly) sent stopped waiting: what it did is
+    /// unknown.
+    #[error("a sent command was cancelled; its effect is unknown")]
+    ActiveCancelled,
+    /// The browser answered a command with a CDP error. The caller of that command gets the error;
+    /// the connection ends rather than guess what the browser did.
+    #[error("the browser answered a command with an error")]
+    ProtocolError,
 }
 
 impl From<Canceled> for CdpError {

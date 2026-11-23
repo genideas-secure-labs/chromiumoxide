@@ -13,6 +13,9 @@ use chromiumoxide_types::{Command, CommandResponse, Method, MethodId, Request, R
 use crate::error::{CdpError, DeadlineExceeded, Result};
 use crate::handler::REQUEST_TIMEOUT;
 
+#[cfg(feature = "pipe-transport")]
+pub mod lifecycle;
+
 /// Deserialize a response
 pub(crate) fn to_command_response<T: Command>(
     resp: Response,
