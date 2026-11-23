@@ -517,11 +517,39 @@ async fn adopt(f: &mut Fixture) -> Page {
         let pages = f.browser.pages().await.expect("pages");
         if let [page] = pages.as_slice() {
             if page.mainframe().await.ok().flatten().is_some() {
-                return page.clone();
+                let page = page.clone();
+                quiesce(f, &page).await;
+                return page;
             }
         }
         assert!(start.elapsed() < PROMPT, "the page was not adopted");
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Wait until the handler's own traffic for the adopted page is over. A page has a main frame
+/// before its initialization chain has finished, and the chain sends each step after the answer
+/// to the one before. A test that measures bytes from here on, holds the driver, or moves the
+/// clock must not share the wire with that chain: under load, a still-running chain put an
+/// internal command on the wire (or in the queue) where the test expected only its own. Quiet
+/// means two consecutive round trips of a sync command during which nothing else was sent.
+async fn quiesce(f: &Fixture, page: &Page) {
+    let start = std::time::Instant::now();
+    let mut quiet = 0;
+    let mut n = 0u32;
+    while quiet < 2 {
+        assert!(start.elapsed() < PROMPT, "the handler never went quiet");
+        n += 1;
+        let before = f.peer.calls().len();
+        tokio::time::timeout(PROMPT, page.execute(eval(&format!("QUIESCE-{n}"))))
+            .await
+            .expect("sync round trip in time")
+            .expect("sync round trip");
+        quiet = if f.peer.calls().len() == before + 1 {
+            quiet + 1
+        } else {
+            0
+        };
     }
 }
 
@@ -584,6 +612,12 @@ async fn page_session_routing_with_decoy() {
         .event_listener::<EventConsoleApiCalled>()
         .await
         .expect("listen");
+    // `event_listener` returns once its registration is queued, not handled: a round trip on the
+    // same page channel makes sure the target has it before the events are sent.
+    tokio::time::timeout(PROMPT, page.execute(eval("LISTEN-SYNC")))
+        .await
+        .expect("sync in time")
+        .expect("sync");
     let console_event = |session: &str, value: &str| {
         json!({ "method": "Runtime.consoleAPICalled", "sessionId": session, "params": {
             "type": "log", "args": [{ "type": "string", "value": value }],
@@ -668,6 +702,12 @@ async fn websocket_constructor_stays_compatible() {
         .event_listener::<EventTargetCreated>()
         .await
         .unwrap();
+    // The registration is queued, not handled, when `event_listener` returns; a round trip
+    // through the handler makes sure it is in place before the event is sent.
+    tokio::time::timeout(PROMPT, browser.version())
+        .await
+        .expect("sync in time")
+        .expect("sync");
     send_tx
         .send(json!({ "method": "Target.targetCreated", "params": {
             "targetInfo": target_info("OTHER", "other", false) }}))
