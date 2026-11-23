@@ -61,6 +61,8 @@ struct PeerState {
     withheld: Vec<String>,
     /// The withheld calls.
     held: Vec<Value>,
+    /// Answer `Page.navigate` but send no lifecycle event: the navigation never loads.
+    navigations_never_load: bool,
 }
 
 enum Ctl {
@@ -103,7 +105,7 @@ fn tagged(mut msg: Value, session: Option<&str>) -> Value {
 }
 
 /// The peer's answer to one call, as Chrome would give it.
-fn answer(call: &Value, navigations: &mut usize) -> Vec<Value> {
+fn answer(call: &Value, navigations: &mut usize, never_load: bool) -> Vec<Value> {
     let id = call["id"].clone();
     let session = call["sessionId"].as_str();
     let result = |r: Value| tagged(json!({ "id": id, "result": r }), session);
@@ -148,6 +150,9 @@ fn answer(call: &Value, navigations: &mut usize) -> Vec<Value> {
                     session,
                 )
             };
+            if never_load {
+                return vec![result(json!({ "frameId": PAGE_FRAME, "loaderId": loader }))];
+            }
             vec![
                 result(json!({ "frameId": PAGE_FRAME, "loaderId": loader })),
                 lifecycle("init"),
@@ -224,8 +229,9 @@ impl PipePeer {
                                 s.held = keep;
                                 take
                             };
+                            let never_load = peer_st.lock().unwrap().navigations_never_load;
                             for call in calls {
-                                let out = if error { vec![error_answer(&call)] } else { answer(&call, &mut navigations) };
+                                let out = if error { vec![error_answer(&call)] } else { answer(&call, &mut navigations, never_load) };
                                 write_frames(&mut wr, &out).await;
                             }
                         }
@@ -253,8 +259,9 @@ impl PipePeer {
                                     }
                                 }
                             }
+                            let never_load = peer_st.lock().unwrap().navigations_never_load;
                             for call in outs {
-                                let out = answer(&call, &mut navigations);
+                                let out = answer(&call, &mut navigations, never_load);
                                 write_frames(&mut wr, &out).await;
                             }
                         }
@@ -675,7 +682,7 @@ async fn websocket_constructor_stays_compatible() {
                 msg = ws.next() => match msg {
                     Some(Ok(WsMessage::Text(text))) => {
                         let call: Value = serde_json::from_str(&text).unwrap();
-                        for out in answer(&call, &mut navigations) {
+                        for out in answer(&call, &mut navigations, false) {
                             let _ = futures::SinkExt::send(&mut ws, WsMessage::Text(out.to_string().into())).await;
                         }
                     }
@@ -1492,4 +1499,209 @@ async fn command_future_deadline_starts_at_first_poll() {
         "the connection is unharmed: {:?}",
         res.as_ref().err()
     );
+}
+
+/// A reader that always has another event ready, until stopped; then the stream ends.
+struct EndlessEvents {
+    stop: Arc<AtomicBool>,
+    frame: Vec<u8>,
+    pos: usize,
+}
+
+impl AsyncRead for EndlessEvents {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.stop.load(Ordering::SeqCst) {
+            return Poll::Ready(Ok(()));
+        }
+        while buf.remaining() > 0 {
+            let pos = self.pos;
+            let n = buf.remaining().min(self.frame.len() - pos);
+            buf.put_slice(&self.frame[pos..pos + n]);
+            self.pos = (pos + n) % self.frame.len();
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Ends the endless stream when the test ends, passing or not, so a handler that never yields
+/// is released instead of spinning a worker thread for the rest of the run.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A peer whose events are always ready cannot keep the handler from its other work: a pass
+/// reads a bounded number of messages, then yields, so a request that needs no wire (here
+/// `pages`) is still answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ready_event_stream_cannot_starve_intake() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let _stop = StopOnDrop(stop.clone());
+    let mut frame = serde_json::to_vec(&json!({
+        "method": "Runtime.consoleAPICalled",
+        "params": { "type": "log", "args": [], "executionContextId": 1, "timestamp": 1.0 },
+    }))
+    .unwrap();
+    frame.push(0);
+    let clock = ManualClock::new();
+    let config = PipeConfig {
+        handler: HandlerConfig::default(),
+        clock: Arc::new(clock.clone()),
+    };
+    let reader = EndlessEvents {
+        stop: stop.clone(),
+        frame,
+        pos: 0,
+    };
+    let (browser, mut handler) =
+        Browser::connect_pipe(reader, tokio::io::sink(), config).expect("connect_pipe");
+    let driver = tokio::spawn(async move { while handler.next().await.is_some() {} });
+
+    let pages = tokio::time::timeout(PROMPT, browser.pages())
+        .await
+        .expect("intake starved by an event stream that is always ready")
+        .expect("pages");
+    assert!(pages.is_empty());
+
+    stop.store(true, Ordering::SeqCst);
+    tokio::time::timeout(PROMPT, driver)
+        .await
+        .expect("the handler ends with its stream")
+        .expect("the driver panicked");
+}
+
+/// A navigation whose caller ran out of time stops holding its page's frame: the page's next
+/// navigation is sent at once, instead of waiting behind a watcher nobody is waiting on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_navigation_frees_the_next_one() {
+    let mut f = start(
+        Opts {
+            budget_ms: 100,
+            ..Opts::default()
+        },
+        |s| s.navigations_never_load = true,
+    );
+    let page = adopt(&mut f).await;
+    let navigates = |f: &Fixture| {
+        f.peer
+            .calls()
+            .iter()
+            .filter(|c| c["method"] == "Page.navigate")
+            .count()
+    };
+    let first = tokio::spawn({
+        let page = page.clone();
+        async move {
+            page.goto(NavigateParams::new("about:blank#first"))
+                .await
+                .map(|_| ())
+        }
+    });
+    eventually("the first navigation on the wire", || navigates(&f) == 1).await;
+    // Queued behind the navigation on the wire, so once it is answered the navigation's own
+    // answer was handled: the navigation now waits only for a load that never comes.
+    tokio::time::timeout(PROMPT, page.execute(eval("NAV-SYNC")))
+        .await
+        .expect("sync in time")
+        .expect("sync");
+
+    f.clock.advance(Duration::from_millis(100));
+    let res = joined(first).await;
+    assert!(
+        matches!(res, Err(CdpError::Timeout)),
+        "the first navigation times out: {:?}",
+        res.as_ref().err()
+    );
+
+    let second = tokio::spawn({
+        let page = page.clone();
+        async move {
+            page.goto(NavigateParams::new("about:blank#second"))
+                .await
+                .map(|_| ())
+        }
+    });
+    eventually("the second navigation is sent", || navigates(&f) == 2).await;
+    f.clock.advance(Duration::from_millis(100));
+    let _ = joined(second).await;
+}
+
+/// A child target whose first initialization command the connection refuses fails its
+/// initialization at once (it gives no page), instead of waiting for an answer to a command that
+/// was never sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_whose_initialization_is_refused_gives_no_page() {
+    const CHILD_TARGET: &str = "CHILD-TARGET-1";
+    let mut f = start(Opts::default(), |s| s.withheld.push("HOLD-MARK".into()));
+    let page = adopt(&mut f).await;
+
+    let mut fill = vec![tokio::spawn({
+        let page = page.clone();
+        async move { page.execute(eval("HOLD-MARK")).await.map(|_| ()) }
+    })];
+    eventually("the held call on the wire", || f.peer.saw_call("HOLD-MARK")).await;
+    for n in 1..MAX_ADMITTED {
+        let page = page.clone();
+        fill.push(tokio::spawn(async move {
+            page.execute(eval(&format!("FILL-{n}"))).await.map(|_| ())
+        }));
+    }
+    // Full once a probe is refused. A probe that is still waiting was admitted instead and now
+    // holds a slot itself, so it is kept and the next probe tried.
+    let start = std::time::Instant::now();
+    loop {
+        assert!(start.elapsed() < PROMPT, "the queue never filled");
+        let probe = tokio::spawn({
+            let page = page.clone();
+            async move { page.execute(eval("PROBE")).await.map(|_| ()) }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if probe.is_finished() {
+            match probe.await.expect("probe panicked") {
+                Err(CdpError::Pipe(PipeError::QueueFull(_))) => break,
+                other => panic!("a probe ended other than refused: {other:?}"),
+            }
+        }
+        fill.push(probe);
+    }
+
+    f.peer.send(json!({
+        "method": "Target.attachedToTarget",
+        "sessionId": PAGE_SESSION,
+        "params": {
+            "sessionId": "CHILD-SESSION-1",
+            "targetInfo": target_info(CHILD_TARGET, "iframe", true),
+            "waitingForDebugger": true,
+        },
+    }));
+    let start = std::time::Instant::now();
+    loop {
+        let got = tokio::time::timeout(
+            PROMPT,
+            f.browser.get_page(
+                chromiumoxide::cdp::browser_protocol::target::TargetId::from(
+                    CHILD_TARGET.to_string(),
+                ),
+            ),
+        )
+        .await
+        .expect("get_page in time");
+        if matches!(got, Err(CdpError::NotFound)) {
+            break;
+        }
+        assert!(
+            start.elapsed() < PROMPT,
+            "the refused child still gives a page: {:?}",
+            got.map(|p| p.target_id().clone())
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(fill);
 }

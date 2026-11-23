@@ -51,6 +51,77 @@ pub mod viewport;
 #[cfg(test)]
 mod scripted_peer_tests;
 
+/// What reaches the handler after its pipe connection ended (screen-play-rs#1735).
+///
+/// In a running handler that window is a cross-thread race: intake is drained at the start of
+/// each pass, so a message is still buffered at termination only if it arrived after that drain
+/// and before the connection's end was read in the same pass. This test opens the window by
+/// calling `terminate` directly with messages buffered, which is the state that race produces.
+#[cfg(all(test, feature = "pipe-transport"))]
+mod pipe_terminate_tests {
+    use super::*;
+    use crate::cmd::lifecycle::{ManualClock, PipeContext};
+    use crate::conn::pipe::PipeSettings;
+    use crate::error::{PipeClosed, PipeError};
+    use futures::channel::mpsc::channel;
+    use futures::channel::oneshot::channel as oneshot_channel;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn messages_buffered_at_the_end_get_the_connections_reason() {
+        let (conn_w, _peer_r) = tokio::io::duplex(1 << 16);
+        let (_peer_w, conn_r) = tokio::io::duplex(1 << 16);
+        let clock: Arc<dyn crate::cmd::lifecycle::LifecycleClock> = Arc::new(ManualClock::new());
+        let driver = Arc::new(futures::task::AtomicWaker::new());
+        let budget = Duration::from_secs(30);
+        let conn = Connection::<CdpEventMessage>::pipe(
+            conn_r,
+            conn_w,
+            PipeSettings {
+                clock: clock.clone(),
+                default_timeout: budget,
+                driver: driver.clone(),
+            },
+        )
+        .expect("pipe connection");
+        let (mut tx, rx) = channel(8);
+        let ctx = PipeContext {
+            clock,
+            budget,
+            driver,
+        };
+        let mut handler =
+            Handler::new_pipe(conn, rx, HandlerConfig::default(), ctx).expect("pipe handler");
+
+        let (plain_tx, mut plain_rx) = oneshot_channel();
+        tx.try_send(HandlerMessage::FetchTargets(plain_tx))
+            .expect("buffered");
+        let (wrapped_tx, mut wrapped_rx) = oneshot_channel();
+        tx.try_send(HandlerMessage::WithContext(
+            Box::new(HandlerMessage::CloseBrowser(wrapped_tx)),
+            CallContext::default(),
+        ))
+        .expect("buffered");
+
+        handler.terminate(PipeClosed::Malformed);
+
+        let want = PipeError::Closed(PipeClosed::Malformed);
+        match plain_rx.try_recv() {
+            Ok(Some(Err(CdpError::Pipe(got)))) => assert_eq!(got, want),
+            other => panic!("a buffered fetch_targets got {other:?}"),
+        }
+        match wrapped_rx.try_recv() {
+            Ok(Some(Err(CdpError::Pipe(got)))) => assert_eq!(got, want),
+            other => panic!("a buffered close got {other:?}"),
+        }
+        assert!(
+            tx.try_send(HandlerMessage::GetPages(oneshot_channel().0))
+                .is_err(),
+            "the handler takes nothing more after its end"
+        );
+    }
+}
+
 /// How many messages one pass of a pipe handler reads before it yields (and wakes itself).
 const PIPE_READ_BUDGET: usize = 64;
 
