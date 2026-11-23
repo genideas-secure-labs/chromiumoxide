@@ -1504,6 +1504,8 @@ async fn command_future_deadline_starts_at_first_poll() {
 /// A reader that always has another event ready, until stopped; then the stream ends.
 struct EndlessEvents {
     stop: Arc<AtomicBool>,
+    /// Bytes handed out so far.
+    served: Arc<AtomicUsize>,
     frame: Vec<u8>,
     pos: usize,
 }
@@ -1522,6 +1524,7 @@ impl AsyncRead for EndlessEvents {
             let n = buf.remaining().min(self.frame.len() - pos);
             buf.put_slice(&self.frame[pos..pos + n]);
             self.pos = (pos + n) % self.frame.len();
+            self.served.fetch_add(n, Ordering::SeqCst);
         }
         Poll::Ready(Ok(()))
     }
@@ -1555,20 +1558,32 @@ async fn a_ready_event_stream_cannot_starve_intake() {
         handler: HandlerConfig::default(),
         clock: Arc::new(clock.clone()),
     };
+    let served = Arc::new(AtomicUsize::new(0));
     let reader = EndlessEvents {
         stop: stop.clone(),
+        served: served.clone(),
         frame,
         pos: 0,
     };
     let (browser, mut handler) =
         Browser::connect_pipe(reader, tokio::io::sink(), config).expect("connect_pipe");
     let driver = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    // Ask only once the handler is inside the stream: a request sent before its first pass
+    // would be taken by that pass's intake, before any event was read.
+    eventually("the handler reads the stream", || {
+        served.load(Ordering::SeqCst) > 4 << 20
+    })
+    .await;
 
     let pages = tokio::time::timeout(PROMPT, browser.pages())
         .await
         .expect("intake starved by an event stream that is always ready")
         .expect("pages");
     assert!(pages.is_empty());
+    assert!(
+        !driver.is_finished(),
+        "the handler answered because the stream had ended, not while it was flowing"
+    );
 
     stop.store(true, Ordering::SeqCst);
     tokio::time::timeout(PROMPT, driver)
@@ -1641,6 +1656,16 @@ async fn a_child_whose_initialization_is_refused_gives_no_page() {
     const CHILD_TARGET: &str = "CHILD-TARGET-1";
     let mut f = start(Opts::default(), |s| s.withheld.push("HOLD-MARK".into()));
     let page = adopt(&mut f).await;
+    // Events are handled in order: once this listener hears an event sent after the child's
+    // attachment, the child target exists. Registered (and synced) while the queue has room.
+    let mut console = page
+        .event_listener::<EventConsoleApiCalled>()
+        .await
+        .expect("listen");
+    tokio::time::timeout(PROMPT, page.execute(eval("LISTEN-SYNC")))
+        .await
+        .expect("sync in time")
+        .expect("sync");
 
     let mut fill = vec![tokio::spawn({
         let page = page.clone();
@@ -1681,6 +1706,16 @@ async fn a_child_whose_initialization_is_refused_gives_no_page() {
             "waitingForDebugger": true,
         },
     }));
+    f.peer.send(
+        json!({ "method": "Runtime.consoleAPICalled", "sessionId": PAGE_SESSION,
+        "params": { "type": "log", "args": [], "executionContextId": 1, "timestamp": 1.0 }}),
+    );
+    tokio::time::timeout(PROMPT, console.next())
+        .await
+        .expect("the event after the attachment")
+        .expect("listener open");
+    // The child exists now. It gives no page once its refused initialization has failed; until
+    // then (and forever, if the refusal is lost) it gives one.
     let start = std::time::Instant::now();
     loop {
         let got = tokio::time::timeout(
