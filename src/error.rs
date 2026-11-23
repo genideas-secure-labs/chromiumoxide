@@ -66,8 +66,9 @@ pub enum CdpError {
     Url(#[from] url::ParseError),
     #[error("{1}")]
     InvalidMessage(String, serde_json::Error),
-    /// A pipe connection refused a command or has ended (screen-play-rs#1735).
-    #[cfg(feature = "pipe-transport")]
+    /// A pipe connection refused a command or has ended (screen-play-rs#1735). The variant and
+    /// its types exist with or without the `pipe-transport` feature, so enabling the feature in
+    /// one crate never changes this enum for another; without the feature nothing produces it.
     #[error("{0}")]
     Pipe(#[from] PipeError),
 }
@@ -95,7 +96,6 @@ pub enum ChannelError {
 /// A refusal ([`PipeError::QueueFull`] .. [`PipeError::IdsExhausted`]) wrote zero bytes of that
 /// command and leaves the connection usable. [`PipeError::Closed`] means the connection is over:
 /// its endpoints are closed and nothing more is sent on it.
-#[cfg(feature = "pipe-transport")]
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PipeError {
     /// The connection already holds its maximum of admitted commands.
@@ -120,7 +120,6 @@ pub enum PipeError {
 
 /// Why a pipe connection ended. Every reason closes both endpoints and fails all pending work; no
 /// command is retried.
-#[cfg(feature = "pipe-transport")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum PipeClosed {
     /// The peer closed its end between frames.

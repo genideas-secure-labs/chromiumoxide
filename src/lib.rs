@@ -68,8 +68,6 @@ pub use chromiumoxide_cdp::cdp;
 pub use chromiumoxide_types::{self as types, Binary, Command, Method, MethodType};
 
 pub use crate::browser::{Browser, BrowserConfig, PageLookup};
-#[cfg(feature = "pipe-transport")]
-pub use crate::browser::{PipeConfig, Transport};
 pub use crate::conn::Connection;
 pub use crate::element::Element;
 pub use crate::error::Result;

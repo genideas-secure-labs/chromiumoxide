@@ -53,8 +53,9 @@ pub struct CommandMessage<T = Result<Response>> {
     pub params: serde_json::Value,
     #[serde(skip_serializing)]
     pub sender: OneshotSender<T>,
-    /// The deadline and cancellation the caller stamped (pipe connections only).
-    #[cfg(feature = "pipe-transport")]
+    /// The deadline and cancellation the caller stamped (pipe connections only; empty
+    /// otherwise). Present with or without the `pipe-transport` feature, so enabling the feature
+    /// in one crate never changes this struct's shape for another.
     #[serde(skip)]
     pub(crate) ctx: CallContext,
 }
@@ -66,21 +67,13 @@ impl<T> CommandMessage<T> {
             session_id: None,
             params: serde_json::to_value(cmd)?,
             sender,
-            #[cfg(feature = "pipe-transport")]
             ctx: CallContext::default(),
         })
     }
 
     /// The lifecycle this command carries, if any.
     pub(crate) fn call_context(&self) -> CallContext {
-        #[cfg(feature = "pipe-transport")]
-        {
-            self.ctx.clone()
-        }
-        #[cfg(not(feature = "pipe-transport"))]
-        {
-            CallContext {}
-        }
+        self.ctx.clone()
     }
 
     /// Carry `ctx` to the connection.
@@ -105,7 +98,6 @@ impl<T> CommandMessage<T> {
             session_id,
             params: serde_json::to_value(cmd)?,
             sender,
-            #[cfg(feature = "pipe-transport")]
             ctx: CallContext::default(),
         })
     }

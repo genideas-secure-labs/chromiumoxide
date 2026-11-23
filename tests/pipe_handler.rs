@@ -22,6 +22,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use chromiumoxide::browser::{PipeConfig, Transport};
 use chromiumoxide::cdp::browser_protocol::browser::GetVersionParams;
 use chromiumoxide::cdp::browser_protocol::page::NavigateParams;
 use chromiumoxide::cdp::browser_protocol::target::{CreateTargetParams, EventTargetCreated};
@@ -33,7 +34,7 @@ use chromiumoxide::conn::pipe::{MAX_ADMITTED, MAX_FRAME_BYTES};
 use chromiumoxide::error::{CdpError, PipeClosed, PipeError};
 use chromiumoxide::handler::{HandlerConfig, REQUEST_TIMEOUT};
 use chromiumoxide::types::{Command, Method, MethodId};
-use chromiumoxide::{Browser, Handler, Page, PipeConfig, Transport};
+use chromiumoxide::{Browser, Handler, Page};
 
 const PAGE_TARGET: &str = "PAGE-TARGET-1";
 const PAGE_SESSION: &str = "PAGE-SESSION-1";
