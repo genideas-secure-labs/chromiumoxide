@@ -124,7 +124,9 @@ fn answer(call: &Value, navigations: &mut usize) -> Vec<Value> {
                 "sessionId": call["params"]["sessionId"], "targetId": PAGE_TARGET,
             }}),
         ],
-        "Page.getFrameTree" => vec![result(json!({ "frameTree": { "frame": frame_json(PAGE_FRAME) } }))],
+        "Page.getFrameTree" => vec![result(
+            json!({ "frameTree": { "frame": frame_json(PAGE_FRAME) } }),
+        )],
         "Page.createIsolatedWorld" => vec![result(json!({ "executionContextId": 1 }))],
         "Runtime.evaluate" => vec![result(
             json!({ "result": { "type": "number", "value": 7, "description": "7" } }),
@@ -138,9 +140,12 @@ fn answer(call: &Value, navigations: &mut usize) -> Vec<Value> {
             *navigations += 1;
             let loader = format!("NAV-LOADER-{navigations}");
             let lifecycle = |name: &str| {
-                tagged(json!({ "method": "Page.lifecycleEvent", "params": {
-                    "frameId": PAGE_FRAME, "loaderId": loader, "name": name, "timestamp": 1.0,
-                }}), session)
+                tagged(
+                    json!({ "method": "Page.lifecycleEvent", "params": {
+                        "frameId": PAGE_FRAME, "loaderId": loader, "name": name, "timestamp": 1.0,
+                    }}),
+                    session,
+                )
             };
             vec![
                 result(json!({ "frameId": PAGE_FRAME, "loaderId": loader })),
@@ -591,7 +596,11 @@ async fn page_session_routing_with_decoy() {
         .await
         .expect("the page's event")
         .expect("listener open");
-    assert_eq!(ev.args[0].value, Some(json!("real")), "only the page's own session");
+    assert_eq!(
+        ev.args[0].value,
+        Some(json!("real")),
+        "only the page's own session"
+    );
 
     let res = tokio::time::timeout(PROMPT, page.execute(eval("1 + 6")))
         .await
@@ -604,7 +613,10 @@ async fn page_session_routing_with_decoy() {
         .into_iter()
         .find(|c| c["method"] == "Runtime.evaluate")
         .expect("the evaluate call");
-    assert_eq!(call["sessionId"], PAGE_SESSION, "sent on the page's session");
+    assert_eq!(
+        call["sessionId"], PAGE_SESSION,
+        "sent on the page's session"
+    );
 }
 
 /// The WebSocket constructor is unchanged: WebSocket transport, its URL, its request and event.
@@ -619,7 +631,9 @@ async fn websocket_constructor_stays_compatible() {
     let (send_tx, mut send_rx) = mpsc::unbounded_channel::<Value>();
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        let mut ws = async_tungstenite::tokio::accept_async(stream).await.unwrap();
+        let mut ws = async_tungstenite::tokio::accept_async(stream)
+            .await
+            .unwrap();
         let mut navigations = 0;
         loop {
             tokio::select! {
@@ -641,7 +655,7 @@ async fn websocket_constructor_stays_compatible() {
         }
     });
     let (browser, mut handler) = Browser::connect(url.clone()).await.expect("connect");
-    tokio::spawn(async move { while let Some(_) = handler.next().await {} });
+    tokio::spawn(async move { while handler.next().await.is_some() {} });
     assert_eq!(browser.transport(), Transport::WebSocket);
     assert_eq!(browser.websocket_endpoint(), Some(url.as_str()));
     assert_eq!(browser.websocket_address(), &url);
@@ -685,7 +699,10 @@ async fn absolute_deadline_survives_event_flood() {
         let page = page.clone();
         async move { page.execute(eval(&marker)).await }
     });
-    eventually("a strict prefix of the command", || f.peer.raw_len() == from + 100).await;
+    eventually("a strict prefix of the command", || {
+        f.peer.raw_len() == from + 100
+    })
+    .await;
 
     let flooding = Arc::new(AtomicBool::new(true));
     let flood = tokio::spawn({
@@ -713,7 +730,8 @@ async fn absolute_deadline_survives_event_flood() {
     let res = joined(call).await;
     assert!(
         matches!(res, Err(CdpError::Timeout)),
-        "the original deadline holds under the flood: {:?}", res.as_ref().err()
+        "the original deadline holds under the flood: {:?}",
+        res.as_ref().err()
     );
     let (mut handler, errs) = f.driver.join().await;
     flooding.store(false, Ordering::SeqCst);
@@ -761,17 +779,29 @@ async fn queued_expiry_writes_zero_bytes() {
 
     f.clock.advance(Duration::from_millis(100));
     let res = joined(b).await;
-    assert!(matches!(res, Err(CdpError::Timeout)), "B times out: {:?}", res.as_ref().err());
+    assert!(
+        matches!(res, Err(CdpError::Timeout)),
+        "B times out: {:?}",
+        res.as_ref().err()
+    );
     f.peer.release("A-MARK");
     let res = joined(a).await;
-    assert!(res.is_ok(), "A completes before its own deadline: {:?}", res.as_ref().err());
+    assert!(
+        res.is_ok(),
+        "A completes before its own deadline: {:?}",
+        res.as_ref().err()
+    );
     settle().await;
     assert!(!f.peer.raw_contains("B-MARK"), "no byte of B was written");
 
     let res = tokio::time::timeout(PROMPT, page.execute(eval("C-MARK")))
         .await
         .expect("C in time");
-    assert!(res.is_ok(), "the connection stays usable: {:?}", res.as_ref().err());
+    assert!(
+        res.is_ok(),
+        "the connection stays usable: {:?}",
+        res.as_ref().err()
+    );
     assert!(!f.peer.raw_contains("B-MARK"));
 }
 
@@ -813,11 +843,15 @@ async fn caller_drop_retires_partial_write() {
     assert_eq!(
         res.as_ref().err().and_then(closed),
         Some(PipeClosed::ActiveCancelled),
-        "the queued call fails with the connection: {:?}", res.as_ref().err()
+        "the queued call fails with the connection: {:?}",
+        res.as_ref().err()
     );
     f.peer.budget(None);
     eventually("end of stream after the prefix", || f.peer.eof()).await;
-    assert!(!f.peer.raw_since(from).contains(&0), "A was never completed");
+    assert!(
+        !f.peer.raw_since(from).contains(&0),
+        "A was never completed"
+    );
     assert!(!f.peer.raw_contains("Q-MARK"), "Q was never written");
 }
 
@@ -849,7 +883,11 @@ async fn flushed_no_reply_expires_terminally() {
 
     f.clock.advance(Duration::from_millis(100));
     let res = joined(a).await;
-    assert!(matches!(res, Err(CdpError::Timeout)), "A times out: {:?}", res.as_ref().err());
+    assert!(
+        matches!(res, Err(CdpError::Timeout)),
+        "A times out: {:?}",
+        res.as_ref().err()
+    );
     let (mut handler, errs) = f.driver.join().await;
     assert_eq!(
         errs.iter().map(closed).collect::<Vec<_>>(),
@@ -860,7 +898,8 @@ async fn flushed_no_reply_expires_terminally() {
     assert_eq!(
         res.as_ref().err().and_then(closed),
         Some(PipeClosed::ActiveExpired),
-        "the queued call settles with the connection, not at its own deadline: {:?}", res.as_ref().err()
+        "the queued call settles with the connection, not at its own deadline: {:?}",
+        res.as_ref().err()
     );
     eventually("the browser's writer closes", || f.peer.eof()).await;
     assert!(!f.peer.raw_contains("Q2-MARK"));
@@ -909,7 +948,7 @@ async fn caller_drop_during_attach_and_silent_readiness() {
     assert_stays_ended(&mut handler);
 
     // (b) discovery never answered.
-    let mut f = start(
+    let f = start(
         Opts {
             budget_ms: 100,
             ..Opts::default()
@@ -985,7 +1024,10 @@ async fn retained_browser_terminal_matrix() {
             }
             Case::EofPending => {
                 calls.push(pending("PEND-MARK"));
-                eventually("the pending call on the wire", || f.peer.saw_call("PEND-MARK")).await;
+                eventually("the pending call on the wire", || {
+                    f.peer.saw_call("PEND-MARK")
+                })
+                .await;
                 let nav_page = page.clone();
                 calls.push(tokio::spawn(async move {
                     nav_page
@@ -999,21 +1041,31 @@ async fn retained_browser_terminal_matrix() {
             }
             Case::Malformed(_) => {
                 calls.push(pending("PEND-MARK"));
-                eventually("the pending call on the wire", || f.peer.saw_call("PEND-MARK")).await;
+                eventually("the pending call on the wire", || {
+                    f.peer.saw_call("PEND-MARK")
+                })
+                .await;
                 f.peer.raw(b"{not json}\0".to_vec());
                 PipeClosed::Malformed
             }
             Case::Oversized => {
                 calls.push(pending("PEND-MARK"));
-                eventually("the pending call on the wire", || f.peer.saw_call("PEND-MARK")).await;
+                eventually("the pending call on the wire", || {
+                    f.peer.saw_call("PEND-MARK")
+                })
+                .await;
                 f.peer.raw(vec![b'{'; MAX_FRAME_BYTES + 1]);
                 PipeClosed::Oversized
             }
             Case::ReadError => {
                 calls.push(pending("PEND-MARK"));
-                eventually("the pending call on the wire", || f.peer.saw_call("PEND-MARK")).await;
+                eventually("the pending call on the wire", || {
+                    f.peer.saw_call("PEND-MARK")
+                })
+                .await;
                 f.faults.read.store(true, Ordering::SeqCst);
-                f.peer.send(json!({ "method": "Target.targetCreated", "params": {
+                f.peer
+                    .send(json!({ "method": "Target.targetCreated", "params": {
                     "targetInfo": target_info("WAKE", "other", false) }}));
                 PipeClosed::Read(io::ErrorKind::ConnectionReset)
             }
@@ -1052,11 +1104,19 @@ async fn retained_browser_terminal_matrix() {
         let res = tokio::time::timeout(PROMPT, f.browser.execute(GetVersionParams::default()))
             .await
             .expect("a retained browser fails at once");
-        assert!(res.is_err(), "{case:?}: the retained browser fails: {:?}", res.as_ref().err());
+        assert!(
+            res.is_err(),
+            "{case:?}: the retained browser fails: {:?}",
+            res.as_ref().err()
+        );
         let res = tokio::time::timeout(PROMPT, page.execute(eval("AFTER-MARK")))
             .await
             .expect("a retained page fails at once");
-        assert!(res.is_err(), "{case:?}: the retained page fails: {:?}", res.as_ref().err());
+        assert!(
+            res.is_err(),
+            "{case:?}: the retained page fails: {:?}",
+            res.as_ref().err()
+        );
         assert_eq!(f.peer.raw_len(), written, "{case:?}: nothing more written");
     }
 }
@@ -1098,7 +1158,10 @@ async fn handler_queue_refusal_is_not_a_panic() {
     let t = PROMPT;
     queue_full(
         "fetch_targets",
-        tokio::time::timeout(t, f.browser.fetch_targets()).await.unwrap().map(|_| ()),
+        tokio::time::timeout(t, f.browser.fetch_targets())
+            .await
+            .unwrap()
+            .map(|_| ()),
     );
     queue_full(
         "page command",
@@ -1123,10 +1186,13 @@ async fn handler_queue_refusal_is_not_a_panic() {
     );
     queue_full(
         "create target",
-        tokio::time::timeout(t, f.browser.new_page(CreateTargetParams::new("about:blank")))
-            .await
-            .unwrap()
-            .map(|_| ()),
+        tokio::time::timeout(
+            t,
+            f.browser.new_page(CreateTargetParams::new("about:blank")),
+        )
+        .await
+        .unwrap()
+        .map(|_| ()),
     );
     queue_full(
         "detach",
@@ -1136,7 +1202,10 @@ async fn handler_queue_refusal_is_not_a_panic() {
     );
     queue_full(
         "close",
-        tokio::time::timeout(t, f.browser.close()).await.unwrap().map(|_| ()),
+        tokio::time::timeout(t, f.browser.close())
+            .await
+            .unwrap()
+            .map(|_| ()),
     );
     assert!(!f.driver.is_finished(), "the handler is still running");
     for refused in [
@@ -1149,7 +1218,11 @@ async fn handler_queue_refusal_is_not_a_panic() {
     ] {
         assert!(!f.peer.raw_contains(refused), "{refused} was written");
     }
-    assert_eq!(get_targets(&f), fetches, "the refused fetch was not written");
+    assert_eq!(
+        get_targets(&f),
+        fetches,
+        "the refused fetch was not written"
+    );
 
     f.peer.release("HOLD-MARK");
     for call in fill {
@@ -1159,7 +1232,11 @@ async fn handler_queue_refusal_is_not_a_panic() {
     let res = tokio::time::timeout(PROMPT, page.execute(eval("AFTER-MARK")))
         .await
         .expect("in time");
-    assert!(res.is_ok(), "after the queue drains a new call works: {:?}", res.as_ref().err());
+    assert!(
+        res.is_ok(),
+        "after the queue drains a new call works: {:?}",
+        res.as_ref().err()
+    );
 }
 
 /// A valid CDP error answer goes to its caller; the connection then ends rather than guess what
@@ -1224,12 +1301,18 @@ async fn api_entry_expiry_before_handler_admission() {
     f.clock.advance(Duration::from_millis(50));
     match futures::poll!(b.as_mut()) {
         Poll::Ready(Err(CdpError::Timeout)) => {}
-        other => panic!("B times out at its entry deadline while the handler is held: {:?}", other.map(|r| r.map(|_| ()))),
+        other => panic!(
+            "B times out at its entry deadline while the handler is held: {:?}",
+            other.map(|r| r.map(|_| ()))
+        ),
     }
     drop(b);
     f.driver.release();
     settle().await;
-    assert!(!f.peer.raw_contains("B11-MARK"), "no byte of B after intake resumes");
+    assert!(
+        !f.peer.raw_contains("B11-MARK"),
+        "no byte of B after intake resumes"
+    );
 
     f.peer.release("A11-MARK");
     let res = joined(a).await;
@@ -1237,7 +1320,11 @@ async fn api_entry_expiry_before_handler_admission() {
     let res = tokio::time::timeout(PROMPT, page.execute(eval("C11-MARK")))
         .await
         .expect("in time");
-    assert!(res.is_ok(), "the connection accepts a new call: {:?}", res.as_ref().err());
+    assert!(
+        res.is_ok(),
+        "the connection accepts a new call: {:?}",
+        res.as_ref().err()
+    );
     assert!(!f.peer.raw_contains("B11-MARK"));
 }
 
@@ -1300,22 +1387,38 @@ async fn command_future_deadline_starts_at_first_poll() {
         serialized: serialized.clone(),
     };
     let mut fut = Box::pin(page.command_future(cmd).expect("command_future"));
-    assert_eq!(serialized.load(Ordering::SeqCst), 0, "constructing does not serialize");
+    assert_eq!(
+        serialized.load(Ordering::SeqCst),
+        0,
+        "constructing does not serialize"
+    );
 
     f.clock.advance_to(Duration::from_millis(60));
-    assert_eq!(serialized.load(Ordering::SeqCst), 0, "nor does time passing unpolled");
+    assert_eq!(
+        serialized.load(Ordering::SeqCst),
+        0,
+        "nor does time passing unpolled"
+    );
     let flag = Arc::new(FlagWaker::default());
     let w = waker(flag.clone());
     let mut cx = Context::from_waker(&w);
-    assert!(fut.as_mut().poll(&mut cx).is_pending(), "first poll at t=60");
-    assert_eq!(serialized.load(Ordering::SeqCst), 1, "serialized at the first poll");
+    assert!(
+        fut.as_mut().poll(&mut cx).is_pending(),
+        "first poll at t=60"
+    );
+    assert_eq!(
+        serialized.load(Ordering::SeqCst),
+        1,
+        "serialized at the first poll"
+    );
 
     f.clock.advance_to(Duration::from_millis(120));
     let at_120 = fut.as_mut().poll(&mut cx);
     assert!(
         at_120.is_pending(),
         "#1909 item 2: still Pending at t=120 (a construction-time deadline would have fired at \
-         t=100): {:?}", at_120.map(|r| r.map(|_| ()))
+         t=100): {:?}",
+        at_120.map(|r| r.map(|_| ()))
     );
 
     flag.0.store(false, Ordering::SeqCst);
@@ -1326,16 +1429,26 @@ async fn command_future_deadline_starts_at_first_poll() {
     );
     match fut.as_mut().poll(&mut cx) {
         Poll::Ready(Err(CdpError::Timeout)) => {}
-        other => panic!("#1909 item 3: Timeout at t=161 while admission is held: {:?}", other.map(|r| r.map(|_| ()))),
+        other => panic!(
+            "#1909 item 3: Timeout at t=161 while admission is held: {:?}",
+            other.map(|r| r.map(|_| ()))
+        ),
     }
     assert!(!f.peer.raw_contains("F1909-MARK"), "zero bytes while held");
     drop(fut);
 
     f.driver.release();
     settle().await;
-    assert!(!f.peer.raw_contains("F1909-MARK"), "zero bytes after intake resumes");
+    assert!(
+        !f.peer.raw_contains("F1909-MARK"),
+        "zero bytes after intake resumes"
+    );
     let res = tokio::time::timeout(PROMPT, page.execute(eval("AFTER-1909")))
         .await
         .expect("in time");
-    assert!(res.is_ok(), "the connection is unharmed: {:?}", res.as_ref().err());
+    assert!(
+        res.is_ok(),
+        "the connection is unharmed: {:?}",
+        res.as_ref().err()
+    );
 }

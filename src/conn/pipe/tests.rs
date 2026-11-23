@@ -188,14 +188,22 @@ fn closed(err: &CdpError) -> Option<PipeClosed> {
 #[tokio::test]
 async fn nul_fragmentation_preserves_event_and_reply() {
     let mut w = wire(1 << 20);
-    let a = w.submit("Runtime.evaluate", json!({"expression": "a"})).unwrap();
-    let b = w.submit("Runtime.evaluate", json!({"expression": "b"})).unwrap();
+    let a = w
+        .submit("Runtime.evaluate", json!({"expression": "a"}))
+        .unwrap();
+    let b = w
+        .submit("Runtime.evaluate", json!({"expression": "b"}))
+        .unwrap();
     let p = pump(&mut w.conn);
     assert!(p.errs.is_empty() && !p.ended, "connection failed early");
 
     // One command in flight: A, delimited by exactly one NUL at its end.
     let (out, _) = read_available(&mut w.to_peer);
-    assert_eq!(out.iter().filter(|b| **b == 0).count(), 1, "A's frame: {out:?}");
+    assert_eq!(
+        out.iter().filter(|b| **b == 0).count(),
+        1,
+        "A's frame: {out:?}"
+    );
     assert_eq!(out.last(), Some(&0));
     let call: Value = serde_json::from_slice(&out[..out.len() - 1]).expect("A is JSON");
     assert_eq!(call["id"], id_json(a));
@@ -211,7 +219,11 @@ async fn nul_fragmentation_preserves_event_and_reply() {
     for chunk in [&bytes[..cut1], &bytes[cut1..cut2], &bytes[cut2..]] {
         w.peer_write(chunk).await;
         let p = pump(&mut w.conn);
-        assert!(p.errs.is_empty(), "a fragment failed the connection: {:?}", p.errs);
+        assert!(
+            p.errs.is_empty(),
+            "a fragment failed the connection: {:?}",
+            p.errs
+        );
         got.extend(p.msgs);
     }
     assert_eq!(got.len(), 2, "the event and A's reply, each once");
@@ -220,7 +232,11 @@ async fn nul_fragmentation_preserves_event_and_reply() {
 
     // A answered: B goes out, again with exactly one NUL.
     let (out, _) = read_available(&mut w.to_peer);
-    assert_eq!(out.iter().filter(|b| **b == 0).count(), 1, "B's frame: {out:?}");
+    assert_eq!(
+        out.iter().filter(|b| **b == 0).count(),
+        1,
+        "B's frame: {out:?}"
+    );
     let call: Value = serde_json::from_slice(&out[..out.len() - 1]).expect("B is JSON");
     assert_eq!(call["id"], id_json(b));
 
@@ -255,7 +271,10 @@ async fn blocked_write_still_delivers_events() {
         "the event must arrive while the write is blocked"
     );
     let (still, _) = w.conn.active_written().expect("still writing");
-    assert!(still < len, "the event was read while the write was blocked");
+    assert!(
+        still < len,
+        "the event was read while the write was blocked"
+    );
 
     // Drain: the write completes once the peer reads.
     let mut seen = Vec::new();
@@ -266,6 +285,9 @@ async fn blocked_write_still_delivers_events() {
             break;
         }
         pump(&mut w.conn);
+        // Give the task back to tokio: its cooperative budget would otherwise make the duplex
+        // report `Pending` forever inside this one poll of the test task.
+        tokio::task::yield_now().await;
     }
     assert_eq!(seen.len(), len, "the whole frame was written once");
 }
@@ -286,7 +308,11 @@ async fn frame_and_queue_bounds_refuse_before_growth() {
     let mut got = Vec::new();
     for _ in 0..100 {
         let p = pump(&mut w.conn);
-        assert!(p.errs.is_empty(), "the exact-size frame was refused: {:?}", p.errs);
+        assert!(
+            p.errs.is_empty(),
+            "the exact-size frame was refused: {:?}",
+            p.errs
+        );
         got.extend(p.msgs);
         if !got.is_empty() {
             break;
@@ -323,7 +349,10 @@ async fn frame_and_queue_bounds_refuse_before_growth() {
     };
     let base = serde_json::to_vec(&call("", 0)).unwrap().len();
     let pad = "b".repeat(MAX_FRAME_BYTES - base);
-    assert_eq!(serde_json::to_vec(&call(&pad, 0)).unwrap().len(), MAX_FRAME_BYTES);
+    assert_eq!(
+        serde_json::to_vec(&call(&pad, 0)).unwrap().len(),
+        MAX_FRAME_BYTES
+    );
     w.submit("Runtime.evaluate", json!({ "expression": pad }))
         .expect("an exact-size frame is admitted");
     let mut out = Vec::new();
@@ -334,7 +363,11 @@ async fn frame_and_queue_bounds_refuse_before_growth() {
             break;
         }
     }
-    assert_eq!(out.len(), MAX_FRAME_BYTES + 1, "the exact frame plus its NUL");
+    assert_eq!(
+        out.len(),
+        MAX_FRAME_BYTES + 1,
+        "the exact frame plus its NUL"
+    );
 
     // Outgoing, one byte over: refused, zero bytes.
     let pad = "b".repeat(MAX_FRAME_BYTES - base + 1);
@@ -346,7 +379,10 @@ async fn frame_and_queue_bounds_refuse_before_growth() {
         other => panic!("an oversized frame must be refused, got {other:?}"),
     }
     pump(&mut w.conn);
-    assert!(read_available(&mut w.to_peer).0.is_empty(), "no byte of it was written");
+    assert!(
+        read_available(&mut w.to_peer).0.is_empty(),
+        "no byte of it was written"
+    );
 
     // The queue: 128 admitted, the 129th refused.
     let mut w = wire(1 << 20);
@@ -370,14 +406,28 @@ async fn eof_and_invalid_frame_settle_pending_once() {
     big.extend_from_slice(b"}");
     let cases: Vec<(&str, Option<Vec<u8>>, PipeClosed)> = vec![
         ("clean EOF", None, PipeClosed::Eof),
-        ("truncated", Some(b"{\"id\":0,\"res".to_vec()), PipeClosed::Truncated),
-        ("malformed JSON", Some(b"{not json}\0".to_vec()), PipeClosed::Malformed),
-        ("raw NUL boundary", Some(b"\0".to_vec()), PipeClosed::Malformed),
+        (
+            "truncated",
+            Some(b"{\"id\":0,\"res".to_vec()),
+            PipeClosed::Truncated,
+        ),
+        (
+            "malformed JSON",
+            Some(b"{not json}\0".to_vec()),
+            PipeClosed::Malformed,
+        ),
+        (
+            "raw NUL boundary",
+            Some(b"\0".to_vec()),
+            PipeClosed::Malformed,
+        ),
         ("oversized", Some(big), PipeClosed::Oversized),
     ];
     for (name, bytes, want) in cases {
         let mut w = wire(1 << 20);
-        let a = w.submit("Runtime.evaluate", json!({"expression": "A"})).unwrap();
+        let a = w
+            .submit("Runtime.evaluate", json!({"expression": "A"}))
+            .unwrap();
         pump(&mut w.conn);
         let (a_frame, _) = read_available(&mut w.to_peer);
         let _b = w
@@ -408,7 +458,10 @@ async fn eof_and_invalid_frame_settle_pending_once() {
         );
         assert!(ended, "{name}: the connection must end");
         let again = pump(&mut w.conn);
-        assert!(again.ended && again.errs.is_empty(), "{name}: ended stays ended");
+        assert!(
+            again.ended && again.errs.is_empty(),
+            "{name}: ended stays ended"
+        );
 
         let (rest, eof) = read_available(&mut w.to_peer);
         assert!(rest.is_empty(), "{name}: nothing written after A: {rest:?}");
@@ -549,20 +602,31 @@ async fn flush_error_and_cancel_cannot_replay() {
         "a failed flush ends the connection"
     );
     let written = log.bytes.lock().unwrap().clone();
-    assert_eq!(written.iter().filter(|b| **b == 0).count(), 1, "A written exactly once");
+    assert_eq!(
+        written.iter().filter(|b| **b == 0).count(),
+        1,
+        "A written exactly once"
+    );
     assert!(log.dropped.load(Ordering::SeqCst), "the writer is released");
     assert!(
         submit(&mut conn, lifecycle(&clock, &driver), "B").is_err(),
         "nothing more is admitted"
     );
-    assert_eq!(*log.bytes.lock().unwrap(), written, "nothing more is written");
+    assert_eq!(
+        *log.bytes.lock().unwrap(),
+        written,
+        "nothing more is written"
+    );
 
     // (b) Cancelled while its flush is pending.
     let (mut conn, log, _peer, clock, driver) = scripted(1 << 20, usize::MAX, Flush::AlwaysPending);
     let lc = lifecycle(&clock, &driver);
     submit(&mut conn, lc.clone(), "A").unwrap();
     let p = pump(&mut conn);
-    assert!(p.errs.is_empty() && !p.ended, "a pending flush is not an error");
+    assert!(
+        p.errs.is_empty() && !p.ended,
+        "a pending flush is not an error"
+    );
     let written = log.bytes.lock().unwrap().clone();
     assert_eq!(written.last(), Some(&0), "A fully written, flush pending");
     lc.cancel();
@@ -582,7 +646,11 @@ async fn flush_error_and_cancel_cannot_replay() {
     submit(&mut conn, lc.clone(), "A").unwrap();
     let p = pump(&mut conn);
     assert!(p.errs.is_empty() && !p.ended);
-    assert_eq!(log.bytes.lock().unwrap().len(), 10, "a strict prefix written");
+    assert_eq!(
+        log.bytes.lock().unwrap().len(),
+        10,
+        "a strict prefix written"
+    );
     lc.cancel();
     let errs = pump_until_end(&mut conn);
     assert_eq!(
@@ -590,7 +658,11 @@ async fn flush_error_and_cancel_cannot_replay() {
         vec![Some(PipeClosed::ActiveCancelled)]
     );
     assert!(log.dropped.load(Ordering::SeqCst));
-    assert_eq!(log.bytes.lock().unwrap().len(), 10, "no byte after the cancel");
+    assert_eq!(
+        log.bytes.lock().unwrap().len(),
+        10,
+        "no byte after the cancel"
+    );
 }
 
 /// Ids are allocated with a checked increment: the last id is used once, then admission refuses
@@ -600,8 +672,12 @@ async fn flush_error_and_cancel_cannot_replay() {
 async fn pipe_id_exhaustion_refuses_without_bytes() {
     let mut w = wire(1 << 20);
     w.conn.set_next_call_id(usize::MAX - 1);
-    let a = w.submit("Runtime.evaluate", json!({"expression": "A"})).unwrap();
-    let b = w.submit("Runtime.evaluate", json!({"expression": "B"})).unwrap();
+    let a = w
+        .submit("Runtime.evaluate", json!({"expression": "A"}))
+        .unwrap();
+    let b = w
+        .submit("Runtime.evaluate", json!({"expression": "B"}))
+        .unwrap();
     assert_eq!(a, CallId::new(usize::MAX - 1));
     assert_eq!(b, CallId::new(usize::MAX));
     match w.submit("Runtime.evaluate", json!({"expression": "WRAPPED-C"})) {
@@ -625,5 +701,9 @@ async fn pipe_id_exhaustion_refuses_without_bytes() {
     pump(&mut w.conn);
     let (rest, _) = read_available(&mut w.to_peer);
     assert!(rest.is_empty(), "nothing after the two admitted commands");
-    assert_eq!(ids, vec![id_json(a), id_json(b)], "exactly the two ids, no wrap");
+    assert_eq!(
+        ids,
+        vec![id_json(a), id_json(b)],
+        "exactly the two ids, no wrap"
+    );
 }
